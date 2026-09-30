@@ -1,0 +1,6 @@
+season,round,race_name,circuit_id,date,driver_id,stop,lap,time_of_day,duration
+2024,1,Bahrain Grand Prix,bahrain,2024-03-02,hulkenberg,1,1,18:05:33,36.604
+2024,1,Bahrain Grand Prix,bahrain,2024-03-02,zhou,1,9,18:18:39,25.208
+2024,1,Bahrain Grand Prix,bahrain,2024-03-02,stroll,1,9,18:18:42,24.418
+2024,1,Bahrain Grand Prix,bahrain,2024-03-02,ocon,1,10,18:20:20,24.877
+2024,1,Bahrain Grand Prix,bahrain,2024-03-02,sargeant,1,10,18:21:19,35.729

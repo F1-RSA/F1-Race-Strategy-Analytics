@@ -1,0 +1,6 @@
+season,round,race_name,circuit_id,circuit_name,locality,country,date,driver_id,driver_number,code,given_name,family_name,nationality,constructor_id,constructor_name,grid,position,points,laps,status,race_time,fastest_lap_time
+2024,1,Bahrain Grand Prix,bahrain,Bahrain International Circuit,Sakhir,Bahrain,2024-03-02,max_verstappen,1,VER,Max,Verstappen,Dutch,red_bull,Red Bull,1,1,26,57,Finished,1:31:44.742,1:32.608
+2024,1,Bahrain Grand Prix,bahrain,Bahrain International Circuit,Sakhir,Bahrain,2024-03-02,perez,11,PER,Sergio,Pérez,Mexican,red_bull,Red Bull,5,2,18,57,Finished,+22.457,1:34.364
+2024,1,Bahrain Grand Prix,bahrain,Bahrain International Circuit,Sakhir,Bahrain,2024-03-02,sainz,55,SAI,Carlos,Sainz,Spanish,ferrari,Ferrari,4,3,15,57,Finished,+25.110,1:34.507
+2024,1,Bahrain Grand Prix,bahrain,Bahrain International Circuit,Sakhir,Bahrain,2024-03-02,leclerc,16,LEC,Charles,Leclerc,Monegasque,ferrari,Ferrari,2,4,12,57,Finished,+39.669,1:34.090
+2024,1,Bahrain Grand Prix,bahrain,Bahrain International Circuit,Sakhir,Bahrain,2024-03-02,russell,63,RUS,George,Russell,British,mercedes,Mercedes,3,5,10,57,Finished,+46.788,1:35.065
