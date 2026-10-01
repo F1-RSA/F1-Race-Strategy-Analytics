@@ -62,3 +62,6 @@ data/
 
 # Terraform state backups (covered by *.tfstate.* above, listed explicitly for clarity)
 *.tfstate.backup
+
+# Presentations (binary files, not suitable for version control)
+docs/presentations/
