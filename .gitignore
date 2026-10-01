@@ -65,3 +65,6 @@ data/
 
 # Presentations (binary files, not suitable for version control)
 docs/presentations/
+
+# Claude Code local settings
+.claude/
