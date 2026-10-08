@@ -47,6 +47,12 @@ terraform.rc
 
 # Secrets / local environment
 .env
+.env.*
+!.env.example
+*.pem
+*-key.json
+*credentials*.json
+service-account*.json
 .venv/
 venv/
 
@@ -59,6 +65,8 @@ __pycache__/
 # Logs and local data
 *.log
 data/
+*.ndjson
+.ruff_cache/
 
 # Terraform state backups (covered by *.tfstate.* above, listed explicitly for clarity)
 *.tfstate.backup

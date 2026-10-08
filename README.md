@@ -1,6 +1,7 @@
 ![F1 Race Strategy Analytics - DENG HS26 · End-to-End Batch Data Pipeline](img/F1-RSA%20Banner%20thin.png)
   
-**Members:** Florentin Genge · Raphael Wunderlin 
+**Team:** 06  
+**Members:** Florentin Genge · Raphael Wunderlin  
 **Module:** Data Engineering (DENG) · Hochschule Luzern · HS26
 
 ---
@@ -153,15 +154,15 @@ The pipeline is scheduled to run every Monday at 06:00 UTC using Kestra, coverin
 
 ---
 
-## Team responsibilities (initial division)
+## Team responsibilities
 
 | Area | Primary | Secondary |
 |------|---------|-----------|
-| Ingestion scripts & API clients | Florentin | Raphael |
-| PostgreSQL schema & Docker Compose | Raphael | Florentin |
-| Kestra orchestration | Florentin | Raphael |
-| Terraform & GCP infrastructure | Raphael | Florentin |
-| Transformation & data model | Florentin | Raphael |
+| Ingestion scripts & API clients | Raphael | Florentin |
+| PostgreSQL schema & Docker Compose | Florentin | Raphael |
+| Kestra orchestration | Raphael | Florentin |
+| Terraform & GCP infrastructure | Florentin | Raphael |
+| Transformation & data model | Raphael | Florentin |
 | Documentation & architecture diagrams | Both | – |
 
 ---
