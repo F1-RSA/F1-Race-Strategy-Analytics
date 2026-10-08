@@ -104,26 +104,37 @@ Ingestion, transformation, orchestration, Terraform and Docker Compose code will
 
 ### Local pipeline (Milestone 1 / Midterm)
 
-> Planned — the Docker Compose setup and ingestion scripts are not yet in the repository.
-
 ```bash
 # 1. Clone the repository
 git clone https://github.com/F1-RSA/F1-Race-Strategy-Analytics.git
 cd F1-Race-Strategy-Analytics
 
-# 2. Copy and fill in environment variables
+# 2. Create the environment file (the defaults work for local development)
 cp .env.example .env
-# Edit .env: set POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
 
-# 3. Start services
-docker compose up -d
+# 3. Build and start all services
+docker compose up -d --build
 
-# 4. Run a backfill for one season
+# 4. Check that everything is healthy
+docker compose ps
+
+# 5. Verify the database connection from inside the network
+docker compose exec ingestion python -c "import socket; socket.create_connection(('db', 5432), 3); print('db reachable')"
+docker compose exec db psql -U f1 -d f1_db -c "SELECT 1;"
+```
+
+Expected: `f1_postgres` shows `healthy`, `f1_ingestion` shows `Up`, and the last two commands print `db reachable` and a single row with `1`.
+
+To stop the services, run `docker compose down`. To also delete the database volume (fresh start), run `docker compose down -v`.
+
+> Planned — the ingestion code and the PostgreSQL schema are not yet in the repository. The ingestion container is currently a placeholder that waits for the database and keeps running.
+
+```bash
+# Run a backfill for one season (planned)
 docker compose exec ingestion python ingest_sessions.py --season 2024
 
-# 5. Verify data in PostgreSQL
-docker compose exec db psql -U $POSTGRES_USER -d $POSTGRES_DB \
-  -c "SELECT count(*) FROM raw_laps;"
+# Verify data in PostgreSQL (planned)
+docker compose exec db psql -U $POSTGRES_USER -d $POSTGRES_DB   -c "SELECT count(*) FROM raw_laps;"
 ```
 
 ### Cloud pipeline (Final milestone)
