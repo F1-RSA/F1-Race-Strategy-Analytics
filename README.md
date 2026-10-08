@@ -1,6 +1,7 @@
 ![F1 Race Strategy Analytics - DENG HS26 · End-to-End Batch Data Pipeline](img/F1-RSA%20Banner%20thin.png)
   
-**Members:** Florentin Genge · Raphael Wunderlin 
+**Team:** 06  
+**Members:** Florentin Genge · Raphael Wunderlin  
 **Module:** Data Engineering (DENG) · Hochschule Luzern · HS26
 
 ---
