@@ -121,20 +121,23 @@ docker compose ps
 # 5. Verify the database connection from inside the network
 docker compose exec ingestion python -c "import socket; socket.create_connection(('db', 5432), 3); print('db reachable')"
 docker compose exec db psql -U f1 -d f1_db -c "SELECT 1;"
+
+# 6. Check that the schema was created
+docker compose exec db psql -U f1 -d f1_db -c "\dt raw.*" -c "\dt meta.*"
 ```
 
-Expected: `f1_postgres` shows `healthy`, `f1_ingestion` shows `Up`, and the last two commands print `db reachable` and a single row with `1`.
+Expected: `f1_postgres` shows `healthy`, `f1_ingestion` shows `Up`, the connection checks print `db reachable` and a single row with `1`, and the last command lists the tables `raw.meetings`, `raw.sessions`, `raw.drivers`, `raw.laps`, `raw.stints`, `raw.pit` and `meta.load_log`. The tables are created by `db/init/` on the first start with an empty volume; see [docs/data_model.md](docs/data_model.md) for the keys.
 
 To stop the services, run `docker compose down`. To also delete the database volume (fresh start), run `docker compose down -v`.
 
-> Planned — the ingestion code and the PostgreSQL schema are not yet in the repository. The ingestion container is currently a placeholder that waits for the database and keeps running.
+> Planned — the ingestion code is not yet in the repository. The ingestion container is currently a placeholder that waits for the database and keeps running.
 
 ```bash
 # Run a backfill for one season (planned)
 docker compose exec ingestion python ingest_sessions.py --season 2024
 
 # Verify data in PostgreSQL (planned)
-docker compose exec db psql -U $POSTGRES_USER -d $POSTGRES_DB   -c "SELECT count(*) FROM raw_laps;"
+docker compose exec db psql -U $POSTGRES_USER -d $POSTGRES_DB   -c "SELECT count(*) FROM raw.laps;"
 ```
 
 ### Cloud pipeline (Final milestone)
