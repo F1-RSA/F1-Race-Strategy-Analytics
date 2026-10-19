@@ -59,3 +59,121 @@ class TokenBucket:
         self._updated = now
 
 
+class HttpError(Exception):
+    """A request failed with a status that retrying cannot fix (4xx other than 429)."""
+
+    def __init__(self, message: str, status_code: int | None = None, body: str = "") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
+
+
+class RetriesExhaustedError(HttpError):
+    """A request still failed with a retryable error after the last retry."""
+
+
+class HttpClient:
+    """GET JSON through the rate limiter, retrying 429, 5xx, timeouts and connection errors.
+
+    Each attempt, retries included, takes a token from the limiter, so retries cannot
+    exceed the configured rate either. Between retries it waits for the server's
+    Retry-After if given, else a random delay in [0, min(backoff_max, backoff_base * 2^n)]
+    for retry n (full jitter: parallel clients do not retry in lockstep).
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        limiter: TokenBucket,
+        *,
+        timeout: float,
+        max_retries: int,
+        backoff_base: float,
+        backoff_max: float,
+        transport: httpx.BaseTransport | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        rng: random.Random | None = None,
+    ) -> None:
+        self._client = httpx.Client(
+            base_url=base_url,
+            timeout=timeout,
+            transport=transport,
+            headers={"Accept": "application/json"},
+        )
+        self._limiter = limiter
+        self._max_retries = max_retries
+        self._backoff_base = backoff_base
+        self._backoff_max = backoff_max
+        self._sleep = sleep
+        self._rng = rng or random.Random()
+
+    def get_json(self, path: str, params: Mapping[str, str | int] | None = None) -> Any:
+        attempts = self._max_retries + 1
+        for attempt in range(attempts):
+            self._limiter.acquire()
+            status_code: int | None = None
+            retry_after: float | None = None
+            try:
+                response = self._client.get(path, params=params)
+            except httpx.TransportError as exc:
+                reason = f"{type(exc).__name__}: {exc}"
+            else:
+                status_code = response.status_code
+                if response.is_success:
+                    return response.json()
+                if status_code != 429 and status_code < 500:
+                    raise HttpError(
+                        f"GET {response.url} returned {status_code}",
+                        status_code=status_code,
+                        body=response.text,
+                    )
+                reason = f"HTTP {status_code}"
+                retry_after = parse_retry_after(
+                    response.headers.get("Retry-After"), datetime.now(UTC)
+                )
+
+            if attempt == attempts - 1:
+                raise RetriesExhaustedError(
+                    f"GET {path} {dict(params or {})} failed after {attempts} attempts: {reason}",
+                    status_code=status_code,
+                )
+            delay = retry_after if retry_after is not None else self._backoff(attempt)
+            logger.warning(
+                "GET %s %s: %s, retry %d/%d in %.1fs",
+                path,
+                dict(params or {}),
+                reason,
+                attempt + 1,
+                self._max_retries,
+                delay,
+            )
+            self._sleep(delay)
+        raise AssertionError("unreachable")
+
+    def _backoff(self, attempt: int) -> float:
+        return self._rng.uniform(0, min(self._backoff_max, self._backoff_base * 2**attempt))
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> HttpClient:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+
+def parse_retry_after(value: str | None, now: datetime) -> float | None:
+    """Seconds to wait from a Retry-After header (delta-seconds or HTTP-date), None if unusable."""
+    if value is None:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        return None
+    return max(0.0, (when - now).total_seconds())
