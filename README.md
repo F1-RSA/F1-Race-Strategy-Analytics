@@ -31,7 +31,7 @@
 **Known risks:**
 - Both APIs are unofficial, community-maintained projects — availability is not guaranteed.
 - Schemas may change without notice.
-- Jolpica & OpenF1 both have rate limits: 4 req/s and 500 req/h without a token.
+- Rate limits: OpenF1 neither documents a limit nor sends rate-limit headers (checked 2026-10-19), so the client throttles itself to 24 req/min (configurable). Jolpica allows 4 req/s and 500 req/h (to be verified in M5).
 - Lap time data may be missing for DNFs, Safety Car periods, or red-flagged sessions.
 
 ---
@@ -76,20 +76,26 @@ See [`docs/f1_pipeline_arch_v01.svg`](docs/f1_pipeline_arch_v01.svg) for the ful
 ```
 F1-Race-Strategy-Analytics/
 ├── README.md
-├── .env.example                # Required environment variables (no secrets committed)
+├── docker-compose.yml          # PostgreSQL and the ingestion container on one network
+├── .env.example                # All configuration; the defaults work unchanged
 ├── .gitignore
+├── ingestion/
+│   ├── Dockerfile              # Ingestion image (placeholder until the CLI exists)
+│   ├── pyproject.toml          # Package, pinned dependencies, ruff and pytest config
+│   ├── f1_ingest/
+│   │   ├── config.py           # Settings from environment variables
+│   │   ├── http.py             # Token bucket rate limiter, retry with backoff
+│   │   └── openf1.py           # OpenF1 client: sessions, drivers, laps, stints, pit
+│   └── tests/                  # Offline tests; fixtures/ holds recorded OpenF1 responses
 ├── docs/
+│   ├── decisions.md                  # Decision log per work package
 │   ├── f1_pipeline_arch_v01.svg      # Architecture v0.1
 │   └── sample_data/                  # Raw API sample responses (CSV)
-│       ├── openf1_laps_sample.csv
-│       ├── openf1_stints_sample.csv
-│       ├── openf1_pit_sample.csv
-│       ├── jolpica_results_sample.csv
-│       └── jolpica_pitstops_sample.csv
+├── flows/, sql/                # Empty placeholders for orchestration and transformation
 └── img/                        # Logo and banner used in the README
 ```
 
-Ingestion, transformation, orchestration, Terraform and Docker Compose code will be added as the project progresses (see backlog).
+The database schema, the ingestion CLI, the transformation, Kestra flows and Terraform are added in later work packages (see backlog).
 
 ---
 
@@ -98,7 +104,7 @@ Ingestion, transformation, orchestration, Terraform and Docker Compose code will
 ### Prerequisites
 
 - Docker and Docker Compose
-- Python 3.11+
+- Python 3.11+ (to run the ingestion tests on the host; if `python3 --version` is older, use `python3.11`)
 - Google Cloud project with billing enabled (for final milestone)
 - Terraform ≥ 1.5 (for final milestone)
 
@@ -131,11 +137,50 @@ To stop the services, run `docker compose down`. To also delete the database vol
 
 ```bash
 # Run a backfill for one season (planned)
-docker compose exec ingestion python ingest_sessions.py --season 2024
+docker compose exec ingestion python -m f1_ingest.cli --season 2024
 
 # Verify data in PostgreSQL (planned)
 docker compose exec db psql -U $POSTGRES_USER -d $POSTGRES_DB   -c "SELECT count(*) FROM raw_laps;"
 ```
+
+### Ingestion package: lint, tests and OpenF1 smoke run
+
+The ingestion package runs on the host in a virtual environment. Run all commands from the repository root (on Windows, activate with `.venv\Scripts\activate`).
+
+```bash
+# 1. Create a virtual environment and install the package with its dev tools (ruff, pytest)
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -e "./ingestion[dev]"
+
+# 2. Lint and check formatting
+ruff check ingestion
+ruff format --check ingestion
+
+# 3. Run the tests (offline: recorded fixtures, network access is blocked)
+pytest ingestion
+```
+
+Expected: `All checks passed!`, `10 files already formatted` and `56 passed`.
+
+Smoke run against the live OpenF1 API (**needs network**). It fetches all five endpoints for one finished race (2024 Bahrain Grand Prix, `session_key` 9472) with five requests and takes about 10 seconds because of the rate limiter. Settings come from environment variables; if none are set, the defaults from `.env.example` apply.
+
+```bash
+python - <<'EOF'
+import logging
+from f1_ingest.config import Settings
+from f1_ingest.openf1 import OpenF1Client
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+with OpenF1Client.from_settings(Settings.from_env()) as client:
+    data = client.fetch_session(9472)
+print({endpoint: len(records) for endpoint, records in data.items()})
+EOF
+```
+
+Expected last line: `{'sessions': 1, 'drivers': 20, 'laps': 1129, 'stints': 63, 'pit': 43}` (counts can change if OpenF1 corrects its data).
+
+The ingestion image does not contain the package yet; it is installed there together with the CLI (M4). The image never contains the tests (`ingestion/.dockerignore`), they run on the host and later in CI.
 
 ### Cloud pipeline (Final milestone)
 
@@ -149,7 +194,7 @@ terraform plan
 terraform apply
 
 # Run full ingestion to cloud
-docker compose run ingestion python ingest_sessions.py --season 2024 --target cloud
+docker compose run ingestion python -m f1_ingest.cli --season 2024 --target cloud
 ```
 
 ---
