@@ -79,11 +79,17 @@ def test_full_reloads_loaded_sessions() -> None:
     assert skipped == []
 
 
-def test_meeting_limit_takes_the_next_meetings_not_yet_loaded() -> None:
+def test_meeting_limit_keeps_the_first_weekends_so_a_repeat_is_a_noop() -> None:
     first, _ = pick(meeting_limit=1)
     assert keys(first) == [1]
-    after_first, _ = pick(loaded={1}, meeting_limit=1)
-    assert keys(after_first) == [3, 4]
+    repeat, skipped = pick(loaded={1}, meeting_limit=1)
+    assert repeat == [] and skipped == [1]
+
+
+def test_larger_meeting_limit_adds_only_the_new_weekend() -> None:
+    chosen, skipped = pick(loaded={1}, meeting_limit=2)
+    assert keys(chosen) == [3, 4]
+    assert skipped == [1]
 
 
 def ending(key: int, meeting: int, date_end: str | None, **extra: Any) -> dict[str, Any]:

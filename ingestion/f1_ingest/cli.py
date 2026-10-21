@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--meeting-limit",
         type=int,
         metavar="N",
-        help="with --season: load only the next N race weekends that would be loaded",
+        help="with --season: only the first N finished race weekends of the season",
     )
     return parser
 

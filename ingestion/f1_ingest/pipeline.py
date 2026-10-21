@@ -75,7 +75,8 @@ def select_sessions(
     """Sessions to load in date order, plus those skipped as loaded or not ready.
 
     Incremental = listed sessions minus loaded ones; full = everything listed. The meeting
-    limit counts weekends among the sessions that would be loaded, so it means "the next N".
+    limit keeps the first N weekends of the finished sessions and is applied before the
+    incremental skip: repeating a command is then a no-op, and a larger limit adds weekends.
     """
     wanted = [s for s in sessions if session_types is None or s["session_type"] in session_types]
     wanted.sort(key=lambda s: s["date_start"])
@@ -83,13 +84,13 @@ def select_sessions(
         s["session_key"]: reason for s in wanted if (reason := not_ready_reason(s, now)) is not None
     }
     wanted = [s for s in wanted if s["session_key"] not in not_ready]
+    if meeting_limit is not None:
+        meetings = list(dict.fromkeys(s["meeting_key"] for s in wanted))[:meeting_limit]
+        wanted = [s for s in wanted if s["meeting_key"] in meetings]
     skipped: list[int] = []
     if mode == "incremental":
         skipped = [s["session_key"] for s in wanted if s["session_key"] in loaded]
         wanted = [s for s in wanted if s["session_key"] not in loaded]
-    if meeting_limit is not None:
-        meetings = list(dict.fromkeys(s["meeting_key"] for s in wanted))[:meeting_limit]
-        wanted = [s for s in wanted if s["meeting_key"] in meetings]
     return Selection(wanted, skipped, not_ready)
 
 
