@@ -6,13 +6,14 @@ import argparse
 import logging
 import sys
 from collections.abc import Sequence
+from datetime import UTC, datetime
 
 import psycopg
 
 from f1_ingest.config import Settings
 from f1_ingest.http import HttpError
 from f1_ingest.openf1 import OpenF1Client, Record
-from f1_ingest.pipeline import RunResult, run
+from f1_ingest.pipeline import RunResult, not_ready_reason, run
 from f1_ingest.sinks.postgres import connect
 
 logger = logging.getLogger("f1_ingest")
@@ -30,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Exit code: 0 all sessions ok, 1 at least one session failed, 2 invalid use.",
     )
     selection = parser.add_mutually_exclusive_group(required=True)
-    selection.add_argument("--season", type=int, help="load the sessions of this year")
+    selection.add_argument("--season", type=int, help="load the finished sessions of this year")
     selection.add_argument("--session-key", type=int, help="load this one session")
     parser.add_argument(
         "--mode",
@@ -102,6 +103,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not sessions:
                 logger.error("OpenF1 returned no sessions for %s", args.season or args.session_key)
                 return EXIT_FAILED
+            if args.session_key is not None:
+                # Named explicitly, so refuse loudly instead of skipping with only a log line.
+                reason = not_ready_reason(sessions[0], datetime.now(UTC))
+                if reason:
+                    logger.error("session %s is %s; nothing was loaded", args.session_key, reason)
+                    return EXIT_FAILED
             result = run(
                 sessions,
                 client=client,
@@ -130,10 +137,11 @@ def _list_sessions(
 
 def _log_summary(result: RunResult) -> None:
     logger.info(
-        "run %s finished: %d loaded, %d already loaded, %d failed",
+        "run %s finished: %d loaded, %d already loaded, %d not ready, %d failed",
         result.run_id,
         len(result.loaded),
         len(result.already_loaded),
+        len(result.not_ready),
         len(result.failed),
     )
     for key, reason in result.failed.items():

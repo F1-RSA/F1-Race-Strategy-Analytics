@@ -25,6 +25,7 @@ class RunResult:
     run_id: str
     loaded: list[int] = field(default_factory=list)
     already_loaded: list[int] = field(default_factory=list)
+    not_ready: dict[int, str] = field(default_factory=dict)
     failed: dict[int, str] = field(default_factory=dict)
 
     @property
@@ -36,21 +37,52 @@ def new_run_id() -> str:
     return f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
 
 
+@dataclass
+class Selection:
+    to_load: list[Record]
+    already_loaded: list[int]
+    not_ready: dict[int, str]  # session_key -> why it is not loaded yet
+
+
+def not_ready_reason(session: Record, now: datetime) -> str | None:
+    """Why a session must not be loaded yet, None if it is finished.
+
+    OpenF1 can restrict or change data while a session is live, and a laps/stints/pit set
+    loaded mid-session would be marked loaded and never refreshed by incremental runs.
+    """
+    if session.get("is_cancelled"):
+        return "cancelled"
+    date_end = session.get("date_end")
+    if not date_end:
+        return "has no date_end"
+    end = datetime.fromisoformat(date_end)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=UTC)
+    if end > now:
+        return f"not finished yet (ends {date_end})"
+    return None
+
+
 def select_sessions(
     sessions: list[Record],
     *,
     loaded: set[int],
     mode: Mode,
     session_types: Collection[str] | None,
+    now: datetime,
     meeting_limit: int | None = None,
-) -> tuple[list[Record], list[int]]:
-    """Returns (sessions to load in date order, keys skipped because already loaded).
+) -> Selection:
+    """Sessions to load in date order, plus those skipped as loaded or not ready.
 
     Incremental = listed sessions minus loaded ones; full = everything listed. The meeting
     limit counts weekends among the sessions that would be loaded, so it means "the next N".
     """
     wanted = [s for s in sessions if session_types is None or s["session_type"] in session_types]
     wanted.sort(key=lambda s: s["date_start"])
+    not_ready = {
+        s["session_key"]: reason for s in wanted if (reason := not_ready_reason(s, now)) is not None
+    }
+    wanted = [s for s in wanted if s["session_key"] not in not_ready]
     skipped: list[int] = []
     if mode == "incremental":
         skipped = [s["session_key"] for s in wanted if s["session_key"] in loaded]
@@ -58,7 +90,7 @@ def select_sessions(
     if meeting_limit is not None:
         meetings = list(dict.fromkeys(s["meeting_key"] for s in wanted))[:meeting_limit]
         wanted = [s for s in wanted if s["meeting_key"] in meetings]
-    return wanted, skipped
+    return Selection(wanted, skipped, not_ready)
 
 
 def load_session(
@@ -99,6 +131,7 @@ def run(
     session_types: Collection[str] | None,
     meeting_limit: int | None = None,
     run_id: str | None = None,
+    now: datetime | None = None,
 ) -> RunResult:
     """Load the selected sessions one after the other; a failed session does not stop the rest."""
     result = RunResult(run_id or new_run_id())
@@ -109,18 +142,25 @@ def run(
     if abandoned:
         logger.warning("marked %d unfinished log rows of earlier runs as failed", abandoned)
 
-    to_load, result.already_loaded = select_sessions(
+    selection = select_sessions(
         sessions,
         loaded=log.loaded_session_keys(ENDPOINTS),
         mode=mode,
         session_types=session_types,
+        now=now or datetime.now(UTC),
         meeting_limit=meeting_limit,
     )
+    to_load = selection.to_load
+    result.already_loaded = selection.already_loaded
+    result.not_ready = selection.not_ready
+    for key, reason in result.not_ready.items():
+        logger.info("session %s skipped: %s", key, reason)
     logger.info(
-        "run %s: %d sessions to load, %d already loaded",
+        "run %s: %d sessions to load, %d already loaded, %d not ready",
         result.run_id,
         len(to_load),
         len(result.already_loaded),
+        len(result.not_ready),
     )
     for session in to_load:
         key = session["session_key"]

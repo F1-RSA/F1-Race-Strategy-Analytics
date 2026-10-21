@@ -106,3 +106,16 @@ def test_session_key_loads_that_session_whatever_its_type(wired, conn: psycopg.C
 def test_unknown_session_key_exits_with_1(wired, conn: psycopg.Connection) -> None:
     wired(FakeOpenF1())
     assert cli.main(["--session-key", "1"]) == 1
+
+
+@pytest.mark.integration
+def test_unfinished_explicit_session_is_rejected_and_nothing_is_written(
+    wired, conn: psycopg.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    live = RACE | {"date_end": "2999-01-01T00:00:00+00:00"}
+    api = wired(FakeOpenF1({"sessions": [httpx.Response(200, json=[live])]}))
+    assert cli.main(["--session-key", "9472"]) == 1
+    assert "not finished yet" in caplog.text
+    assert len(api.requests) == 1  # only the lookup of the session itself
+    assert counts(conn) == dict.fromkeys(ENDPOINTS, 0)
+    assert conn.execute("SELECT count(*) FROM meta.load_log").fetchone() == (0,)

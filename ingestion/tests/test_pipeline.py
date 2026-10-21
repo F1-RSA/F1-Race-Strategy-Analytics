@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -8,7 +9,7 @@ import pytest
 from test_openf1 import FakeOpenF1
 
 from f1_ingest.openf1 import ENDPOINTS
-from f1_ingest.pipeline import run, select_sessions
+from f1_ingest.pipeline import not_ready_reason, run, select_sessions
 from f1_ingest.state import LoadLog
 
 FIXTURES = Path(__file__).parent / "fixtures" / "openf1" / "session_9472"
@@ -39,42 +40,88 @@ def keys(sessions: list[dict[str, Any]]) -> list[int]:
     return [s["session_key"] for s in sessions]
 
 
+NOW = datetime(2024, 12, 1, tzinfo=UTC)
+
+
+def pick(
+    sessions: list[dict[str, Any]] = SEASON, **kwargs: Any
+) -> tuple[list[dict[str, Any]], list[int]]:
+    kwargs = {
+        "loaded": set(),
+        "mode": "incremental",
+        "session_types": {"Race"},
+        "now": NOW,
+    } | kwargs
+    selection = select_sessions(sessions, **kwargs)
+    return selection.to_load, selection.already_loaded
+
+
 def test_selection_is_in_date_order_and_filtered_by_type() -> None:
-    chosen, skipped = select_sessions(
-        SEASON, loaded=set(), mode="incremental", session_types={"Race"}
-    )
+    chosen, skipped = pick()
     assert keys(chosen) == [1, 3, 4, 5]
     assert skipped == []
 
 
 def test_no_type_filter_keeps_every_session() -> None:
-    chosen, _ = select_sessions(SEASON, loaded=set(), mode="full", session_types=None)
+    chosen, _ = pick(mode="full", session_types=None)
     assert keys(chosen) == [1, 2, 3, 4, 5]
 
 
 def test_incremental_skips_loaded_sessions() -> None:
-    chosen, skipped = select_sessions(
-        SEASON, loaded={1, 3}, mode="incremental", session_types={"Race"}
-    )
+    chosen, skipped = pick(loaded={1, 3})
     assert keys(chosen) == [4, 5]
     assert skipped == [1, 3]
 
 
 def test_full_reloads_loaded_sessions() -> None:
-    chosen, skipped = select_sessions(SEASON, loaded={1, 3}, mode="full", session_types={"Race"})
+    chosen, skipped = pick(loaded={1, 3}, mode="full")
     assert keys(chosen) == [1, 3, 4, 5]
     assert skipped == []
 
 
 def test_meeting_limit_takes_the_next_meetings_not_yet_loaded() -> None:
-    first, _ = select_sessions(
-        SEASON, loaded=set(), mode="incremental", session_types={"Race"}, meeting_limit=1
-    )
+    first, _ = pick(meeting_limit=1)
     assert keys(first) == [1]
-    after_first, _ = select_sessions(
-        SEASON, loaded={1}, mode="incremental", session_types={"Race"}, meeting_limit=1
-    )
+    after_first, _ = pick(loaded={1}, meeting_limit=1)
     assert keys(after_first) == [3, 4]
+
+
+def ending(key: int, meeting: int, date_end: str | None, **extra: Any) -> dict[str, Any]:
+    return session(key, meeting, "2024-11-30") | {"date_end": date_end} | extra
+
+
+def test_unfinished_sessions_are_skipped_with_a_reason() -> None:
+    live = ending(10, 7, "2024-12-01T00:00:01+00:00")
+    selection = select_sessions(
+        [*SEASON, live], loaded=set(), mode="full", session_types={"Race"}, now=NOW
+    )
+    assert 10 not in keys(selection.to_load)
+    assert "not finished yet" in selection.not_ready[10]
+
+
+def test_session_ending_exactly_now_counts_as_finished() -> None:
+    assert not_ready_reason(ending(10, 7, "2024-12-01T00:00:00+00:00"), NOW) is None
+
+
+@pytest.mark.parametrize(
+    ("record", "reason"),
+    [
+        (ending(10, 7, "2024-11-30T10:00:00+00:00", is_cancelled=True), "cancelled"),
+        (ending(10, 7, None), "no date_end"),
+        (ending(10, 7, "2024-12-01T01:00:00+01:00"), None),  # 00:00 UTC, offset is honoured
+        (ending(10, 7, "2024-12-01T01:00:00Z"), "not finished"),
+        (ending(10, 7, "2024-11-30T10:00:00"), None),  # no offset: read as UTC
+    ],
+)
+def test_not_ready_reason(record: dict[str, Any], reason: str | None) -> None:
+    found = not_ready_reason(record, NOW)
+    assert (found is None) if reason is None else (reason in (found or ""))
+
+
+def test_unfinished_session_does_not_use_up_the_meeting_limit() -> None:
+    live = ending(10, 7, "2999-01-01T00:00:00+00:00") | {"date_start": "2024-02-01"}
+    chosen, _ = pick([*SEASON, live], meeting_limit=1)
+    assert keys(chosen) == [1]
 
 
 def counts(conn: psycopg.Connection) -> dict[str, int]:
@@ -214,3 +261,25 @@ def test_loaded_needs_all_five_endpoints(conn: psycopg.Connection) -> None:
     assert log.loaded_session_keys(ENDPOINTS) == set()
     log.finish(log.start("r", ENDPOINTS[-1], 7), 0)
     assert log.loaded_session_keys(ENDPOINTS) == {7}
+
+
+@pytest.mark.integration
+def test_unfinished_session_is_neither_requested_nor_logged(conn: psycopg.Connection) -> None:
+    live = session(9999, 2000, "2999-01-01") | {"date_end": "2999-01-01T02:00:00+00:00"}
+    api = FakeOpenF1()
+    result = do_run(api, conn, sessions=[RACE, live])
+    assert result.loaded == [9472] and list(result.not_ready) == [9999]
+    assert {r.url.params["session_key"] for r in api.requests} == {"9472"}
+    assert log_rows(conn, 9999) == []
+    assert conn.execute(
+        "SELECT count(*) FROM raw.sessions WHERE session_key = 9999"
+    ).fetchone() == (0,)
+
+
+@pytest.mark.integration
+def test_injected_clock_decides_what_is_finished(conn: psycopg.Connection) -> None:
+    before_end = datetime(2024, 3, 2, 16, 59, tzinfo=UTC)  # RACE ends 17:00
+    result = do_run(FakeOpenF1(), conn, now=before_end)
+    assert result.loaded == [] and list(result.not_ready) == [9472]
+    result = do_run(FakeOpenF1(), conn, now=datetime(2024, 3, 2, 17, 0, tzinfo=UTC))
+    assert result.loaded == [9472]
