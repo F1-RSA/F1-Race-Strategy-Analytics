@@ -17,6 +17,7 @@ from f1_ingest.jolpica_load import SeasonResult, run_season
 from f1_ingest.openf1 import OpenF1Client, Record
 from f1_ingest.pipeline import RunResult, not_ready_reason, run
 from f1_ingest.sinks.postgres import connect
+from f1_ingest.transform import run_transform
 
 logger = logging.getLogger("f1_ingest")
 
@@ -39,6 +40,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="openf1",
         help="openf1 (default); jolpica loads the race results of --season and takes "
         "only --season, --mode and --target",
+    )
+    parser.add_argument(
+        "--transform",
+        action="store_true",
+        help="after loading OpenF1 data, build core.laps_enriched and run its checks "
+        "(also available alone: python -m f1_ingest.transform)",
     )
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("--season", type=int, help="load the finished sessions of this year")
@@ -84,6 +91,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.season is None or args.meeting_limit or args.session_types
     ):
         parser.error("--source jolpica needs --season and takes no --session-type/--meeting-limit")
+    if args.source == "jolpica" and args.transform:
+        parser.error("--transform works on the OpenF1 tables; use --source openf1")
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
@@ -110,7 +119,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.source == "jolpica":
             return _run_jolpica(args, settings, conn)
-        return _run_openf1(args, settings, conn)
+        code = _run_openf1(args, settings, conn)
+        if args.transform:
+            # Also after a partly failed load: the view shows whatever is loaded.
+            try:
+                transformed = run_transform(conn)
+            except psycopg.Error as exc:
+                logger.error("transform failed: %s", exc)
+                transformed = False
+            if not transformed:
+                code = EXIT_FAILED
+        return code
     finally:
         conn.close()
 

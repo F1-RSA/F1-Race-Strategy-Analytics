@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import argparse
 import logging
+import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib import resources
 
 import psycopg
 from psycopg import sql
 
+from f1_ingest.config import Settings
+from f1_ingest.sinks.postgres import connect
+
 logger = logging.getLogger(__name__)
+
+EXIT_OK, EXIT_FAILED, EXIT_USAGE = 0, 1, 2  # the same codes as f1_ingest.cli
 
 LAPS_ENRICHED_SQL = "laps_enriched.sql"
 LAPS_ENRICHED = "core.laps_enriched"
@@ -120,3 +128,44 @@ def report(grain: GrainCheck, rows: list[Coverage]) -> None:
                 100 * c.share_without_stint,
                 100 * COVERAGE_WARN_SHARE,
             )
+
+
+def run_transform(conn: psycopg.Connection) -> bool:
+    """Create the views, then run the checks; False if the grain check failed.
+
+    Repeatable at any time: the views hold no data and the checks only read.
+    """
+    apply_view(conn)
+    grain = check_grain(conn)
+    report(grain, coverage(conn))
+    return grain.ok
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m f1_ingest.transform",
+        description="Create core.laps_enriched from the raw tables and check it. Needs no "
+        "arguments and can be repeated; database settings come from environment variables.",
+        epilog="Exit code: 0 checks passed, 1 grain check failed, 2 configuration or database "
+        "not usable.",
+    )
+    parser.parse_args(argv)
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    try:
+        conn = connect(Settings.from_env())
+    except (ValueError, psycopg.OperationalError) as exc:
+        logger.error("cannot connect to the database: %s", exc)
+        return EXIT_USAGE
+    try:
+        return EXIT_OK if run_transform(conn) else EXIT_FAILED
+    except psycopg.Error as exc:
+        logger.error("transform failed: %s", exc)
+        return EXIT_FAILED
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

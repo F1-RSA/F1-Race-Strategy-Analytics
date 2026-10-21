@@ -1,3 +1,5 @@
+import logging
+
 import httpx
 import psycopg
 import pytest
@@ -23,6 +25,7 @@ def test_help_lists_every_option(capsys: pytest.CaptureFixture[str]) -> None:
         "--target",
         "--meeting-limit",
         "--source",
+        "--transform",
     ):
         assert option in out
 
@@ -37,6 +40,7 @@ def test_help_lists_every_option(capsys: pytest.CaptureFixture[str]) -> None:
         ["--session-key", "9472", "--meeting-limit", "1"],
         ["--session-key", "9472", "--session-type", "Race"],
         ["--source", "weather", "--season", "2024"],
+        ["--source", "jolpica", "--season", "2024", "--transform"],
         ["--source", "jolpica", "--session-key", "9472"],
         ["--source", "jolpica", "--season", "2024", "--meeting-limit", "1"],
         ["--source", "jolpica", "--season", "2024", "--session-type", "Race"],
@@ -162,3 +166,50 @@ def test_jolpica_unknown_season_exits_1(wired_jolpica, caplog: pytest.LogCapture
     wired_jolpica(FakeJolpica())
     assert cli.main(["--source", "jolpica", "--season", "1900"]) == 1
     assert "season 1900 was not loaded completely" in caplog.text
+
+
+def view_exists(conn: psycopg.Connection) -> bool:
+    return conn.execute("SELECT to_regclass('core.laps_enriched')").fetchone() != (None,)
+
+
+@pytest.mark.integration
+def test_season_run_with_transform_builds_the_view_and_exits_0(
+    wired, conn: psycopg.Connection
+) -> None:
+    conn.execute("DROP VIEW IF EXISTS core.laps_enriched")
+    wired(FakeOpenF1({"sessions": [httpx.Response(200, json=[RACE])]}))
+    assert cli.main(["--season", "2024", "--meeting-limit", "1", "--transform"]) == 0
+    assert conn.execute("SELECT count(*) FROM core.laps_enriched").fetchone() == (114,)
+    assert conn.execute("SELECT count(*) FROM raw.laps").fetchone() == (114,)
+
+
+@pytest.mark.integration
+def test_season_run_without_transform_leaves_core_alone(wired, conn: psycopg.Connection) -> None:
+    conn.execute("DROP VIEW IF EXISTS core.laps_enriched")
+    wired(FakeOpenF1({"sessions": [httpx.Response(200, json=[RACE])]}))
+    assert cli.main(["--season", "2024", "--meeting-limit", "1"]) == 0
+    assert not view_exists(conn)
+
+
+@pytest.mark.integration
+def test_failed_grain_check_makes_the_run_exit_1(
+    wired, conn: psycopg.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wired(FakeOpenF1({"sessions": [httpx.Response(200, json=[RACE])]}))
+    monkeypatch.setattr(cli, "run_transform", lambda connection: False)
+    assert cli.main(["--season", "2024", "--meeting-limit", "1", "--transform"]) == 1
+    assert counts(conn)["laps"] == 114  # the load itself is kept
+
+
+@pytest.mark.integration
+def test_transform_still_runs_after_a_failed_session_and_keeps_exit_1(
+    wired, conn: psycopg.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    wired(
+        FakeOpenF1(
+            {"sessions": [httpx.Response(200, json=[RACE])], "laps": [httpx.Response(500)] * 3}
+        )
+    )
+    caplog.set_level(logging.INFO)
+    assert cli.main(["--season", "2024", "--meeting-limit", "1", "--transform"]) == 1
+    assert "grain check passed" in caplog.text
