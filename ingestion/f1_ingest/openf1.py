@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 
 from f1_ingest.config import Settings
-from f1_ingest.http import HttpClient, HttpError, TokenBucket
+from f1_ingest.http import HttpClient, HttpError, build_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -35,17 +35,11 @@ class OpenF1Client:
     def from_settings(
         cls, settings: Settings, transport: httpx.BaseTransport | None = None
     ) -> OpenF1Client:
-        limiter = TokenBucket(
-            rate_per_second=settings.openf1_requests_per_minute / 60,
-            capacity=settings.openf1_burst,
-        )
-        http = HttpClient(
-            settings.openf1_base_url,
-            limiter,
-            timeout=settings.http_timeout_seconds,
-            max_retries=settings.http_max_retries,
-            backoff_base=settings.http_backoff_base_seconds,
-            backoff_max=settings.http_backoff_max_seconds,
+        http = build_http_client(
+            settings,
+            base_url=settings.openf1_base_url,
+            requests_per_minute=settings.openf1_requests_per_minute,
+            burst=settings.openf1_burst,
             transport=transport,
         )
         return cls(http)

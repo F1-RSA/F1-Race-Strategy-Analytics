@@ -78,3 +78,24 @@ def test_postgres_settings_come_from_env() -> None:
     assert (settings.postgres_host, settings.postgres_port) == ("db", 5433)
     assert (settings.postgres_user, settings.postgres_db) == ("f1", "f1_db")
     assert settings.postgres_password == "secret"
+
+
+def test_jolpica_settings_come_from_env() -> None:
+    settings = Settings.from_env(
+        {"JOLPICA_REQUESTS_PER_MINUTE": "3", "JOLPICA_BURST": "1", "JOLPICA_USER_AGENT": "me/1"}
+    )
+    assert (settings.jolpica_requests_per_minute, settings.jolpica_burst) == (3.0, 1)
+    assert settings.jolpica_user_agent == "me/1"
+    assert settings.jolpica_base_url == "https://api.jolpi.ca/ergast/f1"
+
+
+def test_jolpica_default_rate_stays_below_the_documented_limits() -> None:
+    settings = Settings()
+    assert settings.jolpica_requests_per_minute * 60 < 500  # sustained limit per hour
+    assert settings.jolpica_burst < 4  # burst limit per second
+
+
+@pytest.mark.parametrize("env", [{"JOLPICA_REQUESTS_PER_MINUTE": "0"}, {"JOLPICA_BURST": "0"}])
+def test_invalid_jolpica_rate_is_rejected(env: dict[str, str]) -> None:
+    with pytest.raises(ValueError, match="JOLPICA"):
+        Settings.from_env(env)
