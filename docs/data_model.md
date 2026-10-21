@@ -11,7 +11,7 @@ deletes all data: `docker compose down -v && docker compose up -d --build`.
 | Schema | Purpose |
 |--------|---------|
 | `raw`  | API responses as loaded. Key columns plus the original JSON record. |
-| `core` | Cleaned and joined tables built by transformations (starts with `core.laps_enriched`). Empty until then. |
+| `core` | Cleaned and joined views built by the transformation step from `raw` (`core.laps_enriched`). Typed columns, no JSON. |
 | `meta` | Pipeline bookkeeping. |
 
 ## Raw tables
@@ -76,6 +76,45 @@ stored as integers. Mapping Jolpica races to OpenF1 meetings is left to the tran
 Lap and stint columns used for transformations (`lap_start`, `lap_end`, `compound`,
 `tyre_age_at_start`, durations) are not columns here. They are read from `payload`
 in the transformation step.
+
+## Core views
+
+The transformation step (`python -m f1_ingest.transform`, SQL in `ingestion/f1_ingest/sql/`) creates
+the views with `CREATE OR REPLACE`. Views hold no data of their own, so they are always consistent
+with `raw` and a rerun changes nothing.
+
+### core.laps_enriched
+
+**Grain: one row per `(session_key, driver_number, lap_number)`**, exactly the rows of `raw.laps`.
+`/laps` has no tyre compound; it comes from `/stints`, joined by session, driver and lap range.
+
+| Column | Type | Meaning |
+|--------|------|---------|
+| `session_key`, `driver_number`, `lap_number` | bigint, int, int | Key of the lap |
+| `meeting_key` | bigint | Race weekend |
+| `lap_duration_s` | numeric | Lap time in seconds; NULL if the API has none |
+| `compound` | text | Tyre compound of the stint as the API sends it (`SOFT`, `MEDIUM`, `HARD`, `INTERMEDIATE`, `WET`, also `UNKNOWN`); NULL if no stint covers the lap |
+| `stint_number` | int | Stint the lap was assigned to; NULL if none |
+| `tyre_age_laps` | int | `tyre_age_at_start + (lap_number - lap_start)`; NULL if no stint or no `tyre_age_at_start` |
+| `is_pit_out_lap` | boolean | Lap that starts in the pit lane (from the API) |
+| `has_lap_time` | boolean | `lap_duration` is present |
+
+**Join rule.** `raw.laps LEFT JOIN raw.stints` on session and driver with
+`lap_number BETWEEN lap_start AND lap_end`, taking per lap the stint with the lowest `stint_number`
+(`LATERAL ... ORDER BY stint_number LIMIT 1`):
+
+- *Overlap:* OpenF1 often lists the lap of a pit stop in both stints (stint 1 ends at lap N,
+  stint 2 starts at lap N). A plain join returns that lap twice (100 laps in the 30 Race and Sprint
+  sessions of 2024, 36 of them in Australia). The pit entry is on lap N and the out lap is N + 1,
+  so lap N is the in-lap on the old tyres: the earlier stint wins. This was checked against
+  `/pit` for all 36 overlaps in Australia 2024, and it is an assumption for the others.
+- *Gap:* a lap without a stint stays in the view with NULL `compound`, `stint_number` and
+  `tyre_age_laps` (retirement laps and stints without `lap_start`/`lap_end`: 61 of 29052 laps in
+  2024). Nothing is guessed.
+- *NULL:* a missing `lap_duration` gives `has_lap_time = false` (lap 1 of a standing start, laps
+  of a red flag); a missing `tyre_age_at_start` gives a compound but no `tyre_age_laps`.
+
+Pace queries must filter `has_lap_time AND NOT is_pit_out_lap`; see the examples in `docs/queries/`.
 
 ## Meta tables
 
