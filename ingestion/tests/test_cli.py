@@ -1,6 +1,7 @@
 import httpx
 import psycopg
 import pytest
+from test_jolpica import FakeJolpica
 from test_openf1 import FakeOpenF1
 from test_pipeline import RACE, counts
 
@@ -15,7 +16,14 @@ def test_help_lists_every_option(capsys: pytest.CaptureFixture[str]) -> None:
         cli.main(["--help"])
     assert info.value.code == 0
     out = capsys.readouterr().out
-    for option in ("--season", "--session-key", "--mode", "--target", "--meeting-limit"):
+    for option in (
+        "--season",
+        "--session-key",
+        "--mode",
+        "--target",
+        "--meeting-limit",
+        "--source",
+    ):
         assert option in out
 
 
@@ -28,6 +36,10 @@ def test_help_lists_every_option(capsys: pytest.CaptureFixture[str]) -> None:
         ["--season", "2024", "--meeting-limit", "0"],
         ["--session-key", "9472", "--meeting-limit", "1"],
         ["--session-key", "9472", "--session-type", "Race"],
+        ["--source", "weather", "--season", "2024"],
+        ["--source", "jolpica", "--session-key", "9472"],
+        ["--source", "jolpica", "--season", "2024", "--meeting-limit", "1"],
+        ["--source", "jolpica", "--season", "2024", "--session-type", "Race"],
     ],
 )
 def test_invalid_arguments_exit_with_2(argv: list[str]) -> None:
@@ -119,3 +131,34 @@ def test_unfinished_explicit_session_is_rejected_and_nothing_is_written(
     assert len(api.requests) == 1  # only the lookup of the session itself
     assert counts(conn) == dict.fromkeys(ENDPOINTS, 0)
     assert conn.execute("SELECT count(*) FROM meta.load_log").fetchone() == (0,)
+
+
+@pytest.fixture
+def wired_jolpica(
+    monkeypatch: pytest.MonkeyPatch, test_settings: Settings, conn: psycopg.Connection
+):
+    def install(api: FakeJolpica) -> FakeJolpica:
+        monkeypatch.setattr(
+            cli.JolpicaClient, "from_settings", lambda settings: api.client(max_retries=2)
+        )
+        monkeypatch.setattr(cli, "connect", lambda settings: connect(test_settings))
+        return api
+
+    return install
+
+
+@pytest.mark.integration
+def test_jolpica_season_run_loads_and_exits_0(wired_jolpica, conn: psycopg.Connection) -> None:
+    wired_jolpica(FakeJolpica())
+    assert cli.main(["--source", "jolpica", "--season", "2024"]) == 0
+    assert conn.execute("SELECT count(*) FROM raw.jolpica_races").fetchone() == (24,)
+    assert conn.execute("SELECT count(*) FROM raw.jolpica_results").fetchone() == (59,)
+    # Not a single OpenF1 table was touched.
+    assert conn.execute("SELECT count(*) FROM raw.sessions").fetchone() == (0,)
+
+
+@pytest.mark.integration
+def test_jolpica_unknown_season_exits_1(wired_jolpica, caplog: pytest.LogCaptureFixture) -> None:
+    wired_jolpica(FakeJolpica())
+    assert cli.main(["--source", "jolpica", "--season", "1900"]) == 1
+    assert "season 1900 was not loaded completely" in caplog.text

@@ -86,7 +86,7 @@ in the transformation step.
 | `log_id` | Surrogate key (identity) |
 | `run_id` | Run that made the attempt, same value as `_run_id` in the raw tables |
 | `source`, `endpoint` | e.g. `openf1`, `laps` |
-| `session_key` | Session loaded; NULL only for endpoints that are not per session (`meetings`). `sessions` is logged per session, because a session counts as loaded only with all five of its endpoints |
+| `session_key` | Session loaded; NULL for sources and endpoints that are not per session: Jolpica (see below) and `meetings`. `sessions` is logged per session, because a session counts as loaded only with all five of its endpoints |
 | `status` | `running`, `success` or `failed` (enforced by a check constraint) |
 | `row_count` | Rows written, set when the attempt ends |
 | `started_at`, `finished_at` | Attempt timing |
@@ -96,3 +96,13 @@ row for it. An incremental run takes the sessions the API lists, minus the loade
 A session that was interrupted has `running` or `failed` rows only and is picked up
 again on the next run. A row is inserted as `running` and updated when the attempt ends;
 a new attempt gets a new row, so the history of attempts is kept. Data and the `success` update are committed in one transaction, so a `success` row proves the rows are there. A killed run leaves a `running` row; at the start of the next run, `running` rows of earlier runs are set to `failed` (one run at a time is assumed). The index on `(source, endpoint, session_key, status)` serves this lookup.
+
+**Jolpica rows:** Jolpica has no `session_key`, and the table stays as M3 made it. Rows with
+`source = 'jolpica'` have `session_key` NULL, and the unit of work is part of the `endpoint`
+text: `races:<season>` (schedule), `results:<season>` (the paginated fetch of the season) and
+`results:<season>:<round>`, which is written in the same transaction as the rows of that round.
+A round counts as loaded when `results:<season>:<round>` has a `success` row. The OpenF1 lookup
+only reads `source = 'openf1'` rows with a `session_key`, so the two sources do not see each
+other. Queries over the whole table that group by `session_key` must filter on `source`.
+The cleaner design, nullable `season` and `round` columns, changes this table and is left for
+a later milestone.
