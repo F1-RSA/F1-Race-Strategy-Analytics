@@ -1,4 +1,4 @@
-"""Command line entry point: `python -m f1_ingest.cli --season 2024`."""
+"""Command line entry point: `python -m f1_ingest.cli --season 2024 [--source jolpica]`."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ import psycopg
 
 from f1_ingest.config import Settings
 from f1_ingest.http import HttpError
+from f1_ingest.jolpica import JolpicaClient, PaginationError
+from f1_ingest.jolpica_load import SeasonResult, run_season
 from f1_ingest.openf1 import OpenF1Client, Record
 from f1_ingest.pipeline import RunResult, not_ready_reason, run
 from f1_ingest.sinks.postgres import connect
@@ -26,9 +28,17 @@ DEFAULT_SESSION_TYPES = ["Race"]  # OpenF1 files Sprint sessions under type "Rac
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m f1_ingest.cli",
-        description="Load OpenF1 sessions (sessions, drivers, laps, stints, pit) into raw.*. "
-        "Database and API settings come from environment variables (see .env.example).",
-        epilog="Exit code: 0 all sessions ok, 1 at least one session failed, 2 invalid use.",
+        description="Load OpenF1 sessions (sessions, drivers, laps, stints, pit) or Jolpica "
+        "races and results into raw.*. Database and API settings come from environment "
+        "variables (see .env.example).",
+        epilog="Exit code: 0 all ok, 1 at least one session or round failed, 2 invalid use.",
+    )
+    parser.add_argument(
+        "--source",
+        choices=["openf1", "jolpica"],
+        default="openf1",
+        help="openf1 (default); jolpica loads the race results of --season and takes "
+        "only --season, --mode and --target",
     )
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("--season", type=int, help="load the finished sessions of this year")
@@ -70,6 +80,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--meeting-limit must be at least 1")
     if args.session_key is not None and (args.meeting_limit or args.session_types):
         parser.error("--meeting-limit and --session-type only apply to --season")
+    if args.source == "jolpica" and (
+        args.season is None or args.meeting_limit or args.session_types
+    ):
+        parser.error("--source jolpica needs --season and takes no --session-type/--meeting-limit")
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
@@ -94,36 +108,53 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return EXIT_USAGE
     try:
-        with OpenF1Client.from_settings(settings) as client:
-            try:
-                sessions = _list_sessions(client, args.season, args.session_key)
-            except HttpError as exc:
-                logger.error("could not list sessions: %s", exc)
-                return EXIT_FAILED
-            if not sessions:
-                logger.error("OpenF1 returned no sessions for %s", args.season or args.session_key)
-                return EXIT_FAILED
-            if args.session_key is not None:
-                # Named explicitly, so refuse loudly instead of skipping with only a log line.
-                reason = not_ready_reason(sessions[0], datetime.now(UTC))
-                if reason:
-                    logger.error("session %s is %s; nothing was loaded", args.session_key, reason)
-                    return EXIT_FAILED
-            result = run(
-                sessions,
-                client=client,
-                conn=conn,
-                mode=args.mode,
-                # An explicit key is loaded whatever its type: the user named it.
-                session_types=None
-                if args.session_key is not None
-                else args.session_types or DEFAULT_SESSION_TYPES,
-                meeting_limit=args.meeting_limit,
-            )
+        if args.source == "jolpica":
+            return _run_jolpica(args, settings, conn)
+        return _run_openf1(args, settings, conn)
     finally:
         conn.close()
+
+
+def _run_openf1(args: argparse.Namespace, settings: Settings, conn: psycopg.Connection) -> int:
+    with OpenF1Client.from_settings(settings) as client:
+        try:
+            sessions = _list_sessions(client, args.season, args.session_key)
+        except HttpError as exc:
+            logger.error("could not list sessions: %s", exc)
+            return EXIT_FAILED
+        if not sessions:
+            logger.error("OpenF1 returned no sessions for %s", args.season or args.session_key)
+            return EXIT_FAILED
+        if args.session_key is not None:
+            # Named explicitly, so refuse loudly instead of skipping with only a log line.
+            reason = not_ready_reason(sessions[0], datetime.now(UTC))
+            if reason:
+                logger.error("session %s is %s; nothing was loaded", args.session_key, reason)
+                return EXIT_FAILED
+        result = run(
+            sessions,
+            client=client,
+            conn=conn,
+            mode=args.mode,
+            # An explicit key is loaded whatever its type: the user named it.
+            session_types=None
+            if args.session_key is not None
+            else args.session_types or DEFAULT_SESSION_TYPES,
+            meeting_limit=args.meeting_limit,
+        )
     _log_summary(result)
     return EXIT_OK if result.ok else EXIT_FAILED
+
+
+def _run_jolpica(args: argparse.Namespace, settings: Settings, conn: psycopg.Connection) -> int:
+    with JolpicaClient.from_settings(settings) as client:
+        try:
+            season = run_season(args.season, client=client, conn=conn, mode=args.mode)
+        except (HttpError, PaginationError, LookupError) as exc:
+            logger.error("season %s was not loaded completely: %s", args.season, exc)
+            return EXIT_FAILED
+    _log_season_summary(season)
+    return EXIT_OK if season.ok else EXIT_FAILED
 
 
 def _list_sessions(
@@ -146,6 +177,23 @@ def _log_summary(result: RunResult) -> None:
     )
     for key, reason in result.failed.items():
         logger.error("session %s failed: %s", key, reason)
+
+
+def _log_season_summary(result: SeasonResult) -> None:
+    logger.info(
+        "run %s finished: season %d, %d races in schedule, %d rounds loaded, %d already loaded, "
+        "%d without results yet, %d not started, %d failed",
+        result.run_id,
+        result.season,
+        result.races,
+        len(result.loaded),
+        len(result.already_loaded),
+        len(result.pending),
+        len(result.upcoming),
+        len(result.failed),
+    )
+    for number, reason in result.failed.items():
+        logger.error("round %s failed: %s", number, reason)
 
 
 if __name__ == "__main__":

@@ -72,6 +72,6 @@ def conn(test_settings: Settings) -> Iterator[psycopg.Connection]:
     with connect(test_settings) as connection:
         connection.execute(
             "TRUNCATE raw.meetings, raw.sessions, raw.drivers, raw.laps, raw.stints, raw.pit, "
-            "meta.load_log RESTART IDENTITY"
+            "raw.jolpica_races, raw.jolpica_results, meta.load_log RESTART IDENTITY"
         )
         yield connection

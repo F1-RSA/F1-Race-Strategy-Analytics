@@ -84,9 +84,11 @@ F1-Race-Strategy-Analytics/
 │   ├── Dockerfile              # Image with the package installed; stays idle for docker compose exec
 │   ├── pyproject.toml          # Package, pinned dependencies, ruff and pytest config
 │   ├── f1_ingest/
-│   │   ├── cli.py              # Command line: season / session-key, mode, target
+│   │   ├── cli.py              # Command line: source, season / session-key, mode, target
 │   │   ├── config.py           # Settings from environment variables
 │   │   ├── http.py             # Token bucket rate limiter, retry with backoff
+│   │   ├── jolpica.py          # Jolpica client: season schedule and results, pagination
+│   │   ├── jolpica_load.py     # Jolpica load: schedule, completed rounds, one row per result
 │   │   ├── openf1.py           # OpenF1 client: session listing, drivers, laps, stints, pit
 │   │   ├── pipeline.py         # Session selection (incremental, unfinished) and per-session load
 │   │   ├── state.py            # meta.load_log: attempts and the "loaded" rule
@@ -138,7 +140,9 @@ docker compose exec db psql -U f1 -d f1_db -c "SELECT 1;"
 docker compose exec db psql -U f1 -d f1_db -c "\dt raw.*" -c "\dt meta.*"
 ```
 
-Expected: `f1_postgres` shows `healthy`, `f1_ingestion` shows `Up`, the connection checks print `db reachable` and a single row with `1`, and the last command lists the tables `raw.meetings`, `raw.sessions`, `raw.drivers`, `raw.laps`, `raw.stints`, `raw.pit` and `meta.load_log`. The tables are created by `db/init/` on the first start with an empty volume; see [docs/data_model.md](docs/data_model.md) for the keys.
+Expected: `f1_postgres` shows `healthy`, `f1_ingestion` shows `Up`, the connection checks print `db reachable` and a single row with `1`, and the last command lists the tables `raw.meetings`, `raw.sessions`, `raw.drivers`, `raw.laps`, `raw.stints`, `raw.pit`, `raw.jolpica_races`, `raw.jolpica_results` and `meta.load_log`. The tables are created by `db/init/` on the first start with an empty volume; see [docs/data_model.md](docs/data_model.md) for the keys.
+
+> **Existing databases:** Postgres runs the scripts in `db/init/` only when the data volume is empty. A database created before the Jolpica tables were added (`04_raw_jolpica.sql`) does not have them, and the step-6 check lists only the OpenF1 tables. Recreate it with `docker compose down -v && docker compose up -d --build`; this deletes all loaded data, which a rerun of the ingestion restores.
 
 To stop the services, run `docker compose down`. To also delete the database volume (fresh start), run `docker compose down -v`.
 
@@ -156,6 +160,7 @@ Expected: the log ends with `1 loaded, 0 already loaded, 0 not ready, 0 failed` 
 | Option | Meaning |
 |--------|---------|
 | `--season YEAR` or `--session-key KEY` | One of them is required. A season loads its finished sessions; a key loads that one session (it must be finished) |
+| `--source openf1` (default) / `jolpica` | `jolpica` loads races and results of `--season`, see [below](#load-jolpica-race-results); it takes no `--session-key`, `--session-type` or `--meeting-limit` |
 | `--mode incremental` (default) | Skip sessions that are already loaded |
 | `--mode full` | Reload every selected session (safe, the writes are upserts) |
 | `--meeting-limit N` | With `--season`: only the first N finished race weekends of the season. The same command twice changes nothing; a larger N adds the new weekends |
@@ -174,10 +179,10 @@ docker compose exec db psql -U f1 -d f1_db -c "SELECT 'sessions' AS tbl, count(*
 docker compose exec db psql -U f1 -d f1_db -c "SELECT 'laps' AS tbl, count(*) AS duplicate_keys FROM (SELECT 1 FROM raw.laps GROUP BY session_key, driver_number, lap_number HAVING count(*) > 1) d UNION ALL SELECT 'pit', count(*) FROM (SELECT 1 FROM raw.pit GROUP BY session_key, driver_number, date HAVING count(*) > 1) d;"
 
 # Load log: attempts per session and endpoint
-docker compose exec db psql -U f1 -d f1_db -c "SELECT session_key, endpoint, status, count(*) AS attempts, max(row_count) AS row_count FROM meta.load_log GROUP BY session_key, endpoint, status ORDER BY session_key, min(log_id);"
+docker compose exec db psql -U f1 -d f1_db -c "SELECT session_key, endpoint, status, count(*) AS attempts, max(row_count) AS row_count FROM meta.load_log WHERE source = 'openf1' GROUP BY session_key, endpoint, status ORDER BY session_key, min(log_id);"
 
 # Sessions that count as loaded (all five endpoints succeeded)
-docker compose exec db psql -U f1 -d f1_db -c "SELECT session_key FROM meta.load_log WHERE status = 'success' GROUP BY session_key HAVING count(DISTINCT endpoint) = 5;"
+docker compose exec db psql -U f1 -d f1_db -c "SELECT session_key FROM meta.load_log WHERE source = 'openf1' AND status = 'success' GROUP BY session_key HAVING count(DISTINCT endpoint) = 5;"
 ```
 
 Expected after the first command (counts can change if OpenF1 corrects its data):
@@ -219,6 +224,51 @@ docker compose exec ingestion python -m f1_ingest.cli --season 2024 --meeting-li
 Expected after the kill: the first command prints its progress log and ends with exit code `137` (killed); the endpoints that finished are `success`, the one being loaded is still `running`, later ones are missing (in our run `pit` was `running`). The session `9488` is therefore not loaded. The second run logs `marked 1 unfinished log rows of earlier runs as failed`, reloads `9488` and ends with `1 loaded, 2 already loaded`. Final rows per table: sessions 3, drivers 59, laps 3029, stints 157, pit 98. The log keeps both attempts (`failed` and `success` for `pit`).
 
 Other uses: `--season 2024` loads all 30 Race and Sprint sessions of the season (about 8 seconds each); `--session-key 9472 --mode full` reloads one session. Session keys can be found with `https://api.openf1.org/v1/sessions?year=2024&session_type=Race`. To start from an empty database, run `docker compose down -v` and start again.
+
+### Load Jolpica race results
+
+Jolpica (an Ergast-compatible API) delivers the official race results: finishing position, points, grid, status and fastest lap per driver and race. `--source jolpica` loads one season into `raw.jolpica_races` (the schedule) and `raw.jolpica_results` (one row per driver and race). It needs the Jolpica tables, so a database that was created before M5 must be recreated first (**this deletes its data**): `docker compose down -v && docker compose up -d --build`. The client sends about 6 requests per season (one for the schedule, the results in pages of 100 rows) at no more than 6 per minute, so a season takes under a minute.
+
+```bash
+# Load 2024: 24 races, results of every completed round
+docker compose exec ingestion python -m f1_ingest.cli --source jolpica --season 2024
+```
+
+Expected: the log ends with `season 2024, 24 races in schedule, 24 rounds loaded, 0 already loaded, 0 without results yet, 0 not started, 0 failed` and the command exits with code 0. Only rounds whose race has started are loaded: in a running season the later rounds appear as `not started`, and a round that is over but has no published results yet as `without results yet` (a later run loads it).
+
+```bash
+# Races and results loaded (the API reports 479 result rows for 2024 in MRData.total)
+docker compose exec db psql -U f1 -d f1_db -c "SELECT (SELECT count(*) FROM raw.jolpica_races) AS races, (SELECT count(*) FROM raw.jolpica_results) AS results;"
+
+# Rounds that do not have 20 results (the grid has 20 cars; in 2024 round 3 has 19)
+docker compose exec db psql -U f1 -d f1_db -c "SELECT round, count(*) AS results FROM raw.jolpica_results GROUP BY round HAVING count(*) <> 20 ORDER BY round;"
+
+# Duplicate keys and duplicate positions within a race (0 and 0)
+docker compose exec db psql -U f1 -d f1_db -c "SELECT count(*) - count(DISTINCT (season, round, driver_id)) AS duplicate_keys, count(*) - count(DISTINCT (round, payload#>>'{Results,0,position}')) AS duplicate_positions FROM raw.jolpica_results;"
+
+# Plausibility: race winners of the first four rounds, and the championship top 3
+docker compose exec db psql -U f1 -d f1_db -c "SELECT round, payload->>'raceName' AS race, payload#>>'{Results,0,Driver,code}' AS winner FROM raw.jolpica_results WHERE payload#>>'{Results,0,position}' = '1' ORDER BY round LIMIT 4;"
+docker compose exec db psql -U f1 -d f1_db -c "SELECT payload#>>'{Results,0,Driver,code}' AS driver, sum((payload#>>'{Results,0,points}')::numeric) AS points FROM raw.jolpica_results GROUP BY 1 ORDER BY 2 DESC LIMIT 3;"
+```
+
+Expected: `races` 24 and `results` 479; round 3 with 19 results is the only row of the second query; `duplicate_keys` 0 and `duplicate_positions` 0; winners VER, VER, SAI, VER (Bahrain, Saudi Arabia, Australia, Japan); top 3 VER 399, NOR 344, LEC 327. The points are lower than the official championship (Verstappen 437) because the sprint races are a separate Jolpica endpoint that is not loaded.
+
+**Rerun is safe.** The second command loads nothing (and makes only the schedule request); `--mode full` rewrites every completed round, and the counts above stay as they are:
+
+```bash
+docker compose exec ingestion python -m f1_ingest.cli --source jolpica --season 2024
+docker compose exec ingestion python -m f1_ingest.cli --source jolpica --season 2024 --mode full
+```
+
+Expected: `0 rounds loaded, 24 already loaded` for the first, `24 rounds loaded, 0 already loaded` for the second, and the same row counts and zero duplicates afterwards.
+
+**A running season.** `--season 2026` loads only the rounds that are over (17 of 23 on 2026-10-21, 22 results each) and a repeated run adds nothing until the next race has been published:
+
+```bash
+docker compose exec ingestion python -m f1_ingest.cli --source jolpica --season 2026
+```
+
+Which unit counts as loaded is recorded in `meta.load_log` (`source = 'jolpica'`): the unit is part of the `endpoint` text, `races:2024`, `results:2024` (the paginated fetch) and `results:2024:7` (round 7, written together with its rows).
 
 ### Ingestion package: lint, tests and OpenF1 smoke run
 

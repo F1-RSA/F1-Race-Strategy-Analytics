@@ -19,7 +19,7 @@ class LoadLog:
         self._conn = conn
         self._source = source
 
-    def start(self, run_id: str, endpoint: str, session_key: int) -> int:
+    def start(self, run_id: str, endpoint: str, session_key: int | None = None) -> int:
         row = self._conn.execute(
             "INSERT INTO meta.load_log (run_id, source, endpoint, session_key, status) "
             "VALUES (%s, %s, %s, %s, 'running') RETURNING log_id",
@@ -51,6 +51,19 @@ class LoadLog:
             (self._source, list(endpoints), len(endpoints)),
         ).fetchall()
         return {int(row[0]) for row in rows}
+
+    def succeeded_endpoints(self, prefix: str) -> set[str]:
+        """Endpoints of this source that have a `success` row and start with `prefix`.
+
+        For sources without a session_key (Jolpica): the unit of work is encoded in the
+        endpoint text, e.g. `results:2024:7`.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT endpoint FROM meta.load_log "
+            "WHERE source = %s AND status = 'success' AND starts_with(endpoint, %s)",
+            (self._source, prefix),
+        ).fetchall()
+        return {row[0] for row in rows}
 
     def abandon_stale_running(self, current_run_id: str) -> int:
         """Mark `running` rows of earlier runs as `failed`; they belong to killed processes.

@@ -1,9 +1,9 @@
-"""Postgres sink: upserts OpenF1 records into raw.* on their natural keys."""
+"""Postgres sink: upserts OpenF1 and Jolpica records into raw.* on their natural keys."""
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import psycopg
@@ -55,9 +55,41 @@ class PostgresSink:
         if not rows:
             return 0
         with self._conn.transaction(), self._conn.cursor() as cur:
-            cur.executemany(_upsert_sql(endpoint, columns), rows)
+            cur.executemany(_upsert_sql(endpoint, KEY_COLUMNS[endpoint], columns), rows)
         logger.info("raw.%s: upserted %d rows (run %s)", endpoint, len(rows), run_id)
         return len(rows)
+
+    def upsert_rows(
+        self,
+        table: str,
+        key_columns: tuple[str, ...],
+        rows: Sequence[Mapping[str, Any]],
+        run_id: str,
+    ) -> int:
+        """Write rows of any raw table in one transaction; returns the row count.
+
+        Each row maps the key columns and `payload` to their values. Same rules as `upsert`:
+        a missing key or a duplicate key raises before anything is written.
+        """
+        if not table.isidentifier() or not all(c.isidentifier() for c in key_columns):
+            raise ValueError(f"invalid table or column name: {table} {key_columns}")
+        values: list[tuple[Any, ...]] = []
+        seen: set[tuple[Any, ...]] = set()
+        for index, row in enumerate(rows):
+            key = tuple(row.get(column) for column in key_columns)
+            missing = [c for c, v in zip(key_columns, key, strict=True) if v is None]
+            if missing or "payload" not in row:
+                raise ValueError(f"{table} row #{index} has no {', '.join(missing) or 'payload'}")
+            if key in seen:
+                raise ValueError(f"{table} has more than one row with key {key}")
+            seen.add(key)
+            values.append((*key, Jsonb(row["payload"]), run_id))
+        if not values:
+            return 0
+        with self._conn.transaction(), self._conn.cursor() as cur:
+            cur.executemany(_upsert_sql(table, key_columns, key_columns), values)
+        logger.info("raw.%s: upserted %d rows (run %s)", table, len(values), run_id)
+        return len(values)
 
 
 def _rows(
@@ -79,13 +111,15 @@ def _rows(
     return rows
 
 
-def _upsert_sql(endpoint: str, columns: tuple[str, ...]) -> str:
-    # Table and column names come from the constants above, never from API data.
-    key = ", ".join(KEY_COLUMNS[endpoint])
+def _upsert_sql(table: str, key_columns: tuple[str, ...], columns: tuple[str, ...]) -> str:
+    """`columns` are the key columns plus plain columns (meeting_key); the rest is overwritten."""
+    # Table and column names come from constants or are checked as identifiers, never raw API data.
+    key = ", ".join(key_columns)
     names = ", ".join((*columns, "payload", "_run_id"))
     placeholders = ", ".join(["%s"] * (len(columns) + 2))
+    updates = [f"{c} = EXCLUDED.{c}" for c in columns if c not in key_columns]
+    updates += ["payload = EXCLUDED.payload", "_ingested_at = now()", "_run_id = EXCLUDED._run_id"]
     return (
-        f"INSERT INTO raw.{endpoint} ({names}) VALUES ({placeholders}) "
-        f"ON CONFLICT ({key}) DO UPDATE SET meeting_key = EXCLUDED.meeting_key, "
-        "payload = EXCLUDED.payload, _ingested_at = now(), _run_id = EXCLUDED._run_id"
+        f"INSERT INTO raw.{table} ({names}) VALUES ({placeholders}) "
+        f"ON CONFLICT ({key}) DO UPDATE SET {', '.join(updates)}"
     )

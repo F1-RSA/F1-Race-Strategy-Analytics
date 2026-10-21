@@ -195,3 +195,40 @@ NOW = datetime(2024, 3, 2, 15, 0, 0, tzinfo=UTC)
 )
 def test_parse_retry_after(header: str | None, expected: float | None) -> None:
     assert parse_retry_after(header, NOW) == expected
+
+
+def test_custom_headers_are_sent_next_to_accept() -> None:
+    recorder = Recorder([httpx.Response(200, json=[])])
+    http = HttpClient(
+        "https://example.test/api",
+        TokenBucket(10, 1),
+        timeout=5,
+        max_retries=0,
+        backoff_base=1,
+        backoff_max=1,
+        headers={"User-Agent": "f1-test/1.0"},
+        transport=httpx.MockTransport(recorder.handler),
+    )
+    http.get_json("races.json")
+    headers = recorder.requests[0].headers
+    assert headers["user-agent"] == "f1-test/1.0"
+    assert headers["accept"] == "application/json"
+
+
+def test_build_http_client_uses_the_given_api_settings() -> None:
+    from f1_ingest.config import Settings
+    from f1_ingest.http import build_http_client
+
+    recorder = Recorder([httpx.Response(200, json={"ok": True})])
+    http = build_http_client(
+        Settings(),
+        base_url="https://example.test/ergast/f1",
+        requests_per_minute=6,
+        burst=2,
+        headers={"User-Agent": "f1-test/1.0"},
+        transport=httpx.MockTransport(recorder.handler),
+    )
+    assert http.get_json("2024/races.json", {"limit": 100}) == {"ok": True}
+    assert (
+        str(recorder.requests[0].url) == "https://example.test/ergast/f1/2024/races.json?limit=100"
+    )

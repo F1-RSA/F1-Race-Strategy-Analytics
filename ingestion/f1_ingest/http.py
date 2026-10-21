@@ -12,6 +12,8 @@ from typing import Any
 
 import httpx
 
+from f1_ingest.config import Settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -90,6 +92,7 @@ class HttpClient:
         max_retries: int,
         backoff_base: float,
         backoff_max: float,
+        headers: Mapping[str, str] | None = None,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
@@ -98,7 +101,7 @@ class HttpClient:
             base_url=base_url,
             timeout=timeout,
             transport=transport,
-            headers={"Accept": "application/json"},
+            headers={"Accept": "application/json", **(headers or {})},
         )
         self._limiter = limiter
         self._max_retries = max_retries
@@ -161,6 +164,29 @@ class HttpClient:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+
+def build_http_client(
+    settings: Settings,
+    *,
+    base_url: str,
+    requests_per_minute: float,
+    burst: int,
+    headers: Mapping[str, str] | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> HttpClient:
+    """One client per API: its own base URL, rate limit and headers, shared retry settings."""
+    limiter = TokenBucket(rate_per_second=requests_per_minute / 60, capacity=burst)
+    return HttpClient(
+        base_url,
+        limiter,
+        timeout=settings.http_timeout_seconds,
+        max_retries=settings.http_max_retries,
+        backoff_base=settings.http_backoff_base_seconds,
+        backoff_max=settings.http_backoff_max_seconds,
+        headers=headers,
+        transport=transport,
+    )
 
 
 def parse_retry_after(value: str | None, now: datetime) -> float | None:

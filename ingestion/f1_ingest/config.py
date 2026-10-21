@@ -20,6 +20,13 @@ class Settings:
     http_max_retries: int = 5
     http_backoff_base_seconds: float = 1.0
     http_backoff_max_seconds: float = 60.0
+    jolpica_base_url: str = "https://api.jolpi.ca/ergast/f1"
+    # Jolpica documents 4 requests/second and 500/hour (docs/rate_limits.md) and says the limits
+    # will decrease; 6/min = 360/hour keeps a wide margin for a few requests per season.
+    jolpica_requests_per_minute: float = 6.0
+    jolpica_burst: int = 2
+    # Jolpica asks nothing specific, but an identifiable client is easier to contact than to block.
+    jolpica_user_agent: str = "f1-rsa-hslu-deng-hs26/1.0"
     # Host default suits runs from the host; inside the compose network .env sets POSTGRES_HOST=db.
     postgres_host: str = "localhost"
     postgres_port: int = 5432
@@ -47,6 +54,12 @@ class Settings:
             http_backoff_max_seconds=_read(
                 env, "HTTP_BACKOFF_MAX_SECONDS", float, defaults.http_backoff_max_seconds
             ),
+            jolpica_base_url=_read(env, "JOLPICA_BASE_URL", str, defaults.jolpica_base_url),
+            jolpica_requests_per_minute=_read(
+                env, "JOLPICA_REQUESTS_PER_MINUTE", float, defaults.jolpica_requests_per_minute
+            ),
+            jolpica_burst=_read(env, "JOLPICA_BURST", int, defaults.jolpica_burst),
+            jolpica_user_agent=_read(env, "JOLPICA_USER_AGENT", str, defaults.jolpica_user_agent),
             postgres_host=_read(env, "POSTGRES_HOST", str, defaults.postgres_host),
             postgres_port=_read(env, "POSTGRES_PORT", int, defaults.postgres_port),
             postgres_user=_read(env, "POSTGRES_USER", str, defaults.postgres_user),
@@ -61,6 +74,10 @@ class Settings:
             raise ValueError("OPENF1_REQUESTS_PER_MINUTE must be greater than 0")
         if self.openf1_burst < 1:
             raise ValueError("OPENF1_BURST must be at least 1")
+        if self.jolpica_requests_per_minute <= 0:
+            raise ValueError("JOLPICA_REQUESTS_PER_MINUTE must be greater than 0")
+        if self.jolpica_burst < 1:
+            raise ValueError("JOLPICA_BURST must be at least 1")
         if self.http_timeout_seconds <= 0:
             raise ValueError("HTTP_TIMEOUT_SECONDS must be greater than 0")
         if self.http_max_retries < 0:
