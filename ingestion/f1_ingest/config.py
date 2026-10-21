@@ -20,6 +20,12 @@ class Settings:
     http_max_retries: int = 5
     http_backoff_base_seconds: float = 1.0
     http_backoff_max_seconds: float = 60.0
+    # Host default suits runs from the host; inside the compose network .env sets POSTGRES_HOST=db.
+    postgres_host: str = "localhost"
+    postgres_port: int = 5432
+    postgres_user: str = "f1"
+    postgres_password: str = ""
+    postgres_db: str = "f1_db"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -41,6 +47,11 @@ class Settings:
             http_backoff_max_seconds=_read(
                 env, "HTTP_BACKOFF_MAX_SECONDS", float, defaults.http_backoff_max_seconds
             ),
+            postgres_host=_read(env, "POSTGRES_HOST", str, defaults.postgres_host),
+            postgres_port=_read(env, "POSTGRES_PORT", int, defaults.postgres_port),
+            postgres_user=_read(env, "POSTGRES_USER", str, defaults.postgres_user),
+            postgres_password=_read(env, "POSTGRES_PASSWORD", str, defaults.postgres_password),
+            postgres_db=_read(env, "POSTGRES_DB", str, defaults.postgres_db),
         )
         settings._validate()
         return settings

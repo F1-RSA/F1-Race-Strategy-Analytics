@@ -55,18 +55,27 @@ class OpenF1Client:
         # Checked here because OpenF1 answers unknown endpoints with the same 404 as "no data".
         if endpoint not in ENDPOINTS:
             raise ValueError(f"unknown OpenF1 endpoint {endpoint!r}, expected one of {ENDPOINTS}")
+        records = self._get(endpoint, {"session_key": session_key})
+        logger.info("openf1 %s session_key=%s: %d records", endpoint, session_key, len(records))
+        return records
+
+    def list_sessions(self, year: int) -> list[Record]:
+        """All sessions of a season (every type); [] if OpenF1 has none."""
+        records = self._get("sessions", {"year": year})
+        logger.info("openf1 sessions year=%s: %d records", year, len(records))
+        return records
+
+    def _get(self, endpoint: str, params: dict[str, int]) -> list[Record]:
         try:
-            records = self._http.get_json(endpoint, {"session_key": session_key})
+            records = self._http.get_json(endpoint, params)
         except HttpError as exc:
             if exc.status_code == 404 and _is_no_results(exc.body):
-                logger.info("openf1 %s session_key=%s: no records", endpoint, session_key)
                 return []
             raise
         if not isinstance(records, list):
             raise ValueError(
                 f"OpenF1 {endpoint} returned {type(records).__name__}, expected a list"
             )
-        logger.info("openf1 %s session_key=%s: %d records", endpoint, session_key, len(records))
         return records
 
     def fetch_session(self, session_key: int) -> dict[str, list[Record]]:

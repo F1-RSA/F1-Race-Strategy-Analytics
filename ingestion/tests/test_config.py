@@ -64,5 +64,17 @@ def test_env_example_matches_defaults() -> None:
     for line in ENV_EXAMPLE.read_text().splitlines():
         if line and not line.startswith("#") and "=" in line:
             key, value = line.split("=", 1)
-            env[key] = value
+            # The database values belong to compose (POSTGRES_HOST=db only resolves in its
+            # network); the code defaults target a run from the host instead.
+            if not key.startswith("POSTGRES_"):
+                env[key] = value
     assert Settings.from_env(env) == Settings()
+
+
+def test_postgres_settings_come_from_env() -> None:
+    settings = Settings.from_env(
+        {"POSTGRES_HOST": "db", "POSTGRES_PORT": "5433", "POSTGRES_PASSWORD": "secret"}
+    )
+    assert (settings.postgres_host, settings.postgres_port) == ("db", 5433)
+    assert (settings.postgres_user, settings.postgres_db) == ("f1", "f1_db")
+    assert settings.postgres_password == "secret"

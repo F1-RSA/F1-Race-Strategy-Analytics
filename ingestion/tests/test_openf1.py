@@ -154,3 +154,17 @@ def test_from_settings_wires_rate_and_base_url() -> None:
     with OpenF1Client.from_settings(settings, transport=httpx.MockTransport(api.handler)) as c:
         assert c.fetch("sessions", SESSION_KEY) == fixture("sessions")
     assert str(api.requests[0].url).startswith("https://mirror.example.test/v1/sessions")
+
+
+def test_list_sessions_filters_by_year_and_returns_records_unchanged() -> None:
+    listed = [*fixture("sessions"), {"session_key": 9480, "meeting_key": 1230, "extra": [1, 2]}]
+    api = FakeOpenF1({"sessions": [httpx.Response(200, json=listed)]})
+    with api.client() as client:
+        assert client.list_sessions(2024) == listed
+    assert [str(r.url) for r in api.requests] == [f"{BASE_URL}/sessions?year=2024"]
+
+
+def test_list_sessions_without_results_is_empty() -> None:
+    api = FakeOpenF1({"sessions": [httpx.Response(404, content=NO_RESULTS)]})
+    with api.client() as client:
+        assert client.list_sessions(1999) == []

@@ -9,6 +9,8 @@ description = "Ingestion clients for the F1 Race Strategy Analytics pipeline"
 requires-python = ">=3.11"
 dependencies = [
     "httpx==0.28.1",
+    # The binary wheel bundles libpq, so the slim image needs no system packages.
+    "psycopg[binary]==3.3.6",
 ]
 
 [project.optional-dependencies]
@@ -18,7 +20,7 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["f1_ingest"]
+packages = ["f1_ingest", "f1_ingest.sinks"]
 
 [tool.ruff]
 line-length = 100
@@ -31,3 +33,8 @@ select = ["E", "F", "W", "I", "UP", "B"]
 testpaths = ["tests"]
 # Lets `pytest ingestion` import f1_ingest even without the editable install.
 pythonpath = ["."]
+markers = [
+    "integration: needs the compose Postgres (docker compose up -d db); skipped if unreachable",
+]
+# Plain `pytest ingestion` stays offline; `pytest ingestion -m integration` runs the database tests.
+addopts = '-m "not integration"'

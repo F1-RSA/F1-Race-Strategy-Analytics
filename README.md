@@ -66,7 +66,7 @@ See [`docs/f1_pipeline_arch_v01.svg`](docs/f1_pipeline_arch_v01.svg) for the ful
 ## Ingestion strategy
 
 **Full load (backfill):** On first run, load all available sessions from 2023 to present.  
-**Incremental load:** After each race weekend, load only new `session_key` values not yet present in the database. Idempotency is ensured by upserting on `(session_key, driver_number, lap_number)`.  
+**Incremental load:** After each race weekend, load only new `session_key` values not yet present in the database. Idempotency is ensured by upserting on the natural key of each raw table (for laps `(session_key, driver_number, lap_number)`).  
 **Failure handling:** Failed session loads are logged and retried by the Kestra workflow on next run. Partial loads do not corrupt existing data.
 
 ---
@@ -79,15 +79,21 @@ F1-Race-Strategy-Analytics/
 ├── docker-compose.yml          # PostgreSQL and the ingestion container on one network
 ├── .env.example                # All configuration; the defaults work unchanged
 ├── .gitignore
+├── db/init/                    # Schema scripts (schemas, raw tables, load log), run on first start
 ├── ingestion/
-│   ├── Dockerfile              # Ingestion image (placeholder until the CLI exists)
+│   ├── Dockerfile              # Image with the package installed; stays idle for docker compose exec
 │   ├── pyproject.toml          # Package, pinned dependencies, ruff and pytest config
 │   ├── f1_ingest/
+│   │   ├── cli.py              # Command line: season / session-key, mode, target
 │   │   ├── config.py           # Settings from environment variables
 │   │   ├── http.py             # Token bucket rate limiter, retry with backoff
-│   │   └── openf1.py           # OpenF1 client: sessions, drivers, laps, stints, pit
-│   └── tests/                  # Offline tests; fixtures/ holds recorded OpenF1 responses
+│   │   ├── openf1.py           # OpenF1 client: session listing, drivers, laps, stints, pit
+│   │   ├── pipeline.py         # Session selection (incremental, unfinished) and per-session load
+│   │   ├── state.py            # meta.load_log: attempts and the "loaded" rule
+│   │   └── sinks/postgres.py   # Upsert into raw.* on the natural keys
+│   └── tests/                  # Offline tests, plus `integration` tests that need the compose db
 ├── docs/
+│   ├── data_model.md                 # Schemas, keys and the load log
 │   ├── decisions.md                  # Decision log per work package
 │   ├── f1_pipeline_arch_v01.svg      # Architecture v0.1
 │   └── sample_data/                  # Raw API sample responses (CSV)
@@ -95,7 +101,7 @@ F1-Race-Strategy-Analytics/
 └── img/                        # Logo and banner used in the README
 ```
 
-The database schema, the ingestion CLI, the transformation, Kestra flows and Terraform are added in later work packages (see backlog).
+The transformation, Kestra flows and Terraform are added in later work packages (see backlog).
 
 ---
 
@@ -136,15 +142,83 @@ Expected: `f1_postgres` shows `healthy`, `f1_ingestion` shows `Up`, the connecti
 
 To stop the services, run `docker compose down`. To also delete the database volume (fresh start), run `docker compose down -v`.
 
-> Planned — the ingestion code is not yet in the repository. The ingestion container is currently a placeholder that waits for the database and keeps running.
+### Load data with the ingestion CLI
+
+The commands run inside the ingestion container, which has the package installed. They read the live OpenF1 API (**needs network**) and write to the `raw.*` tables and `meta.load_log`. The client allows 24 requests per minute, so one race takes about 8 seconds.
 
 ```bash
-# Run a backfill for one season (planned)
-docker compose exec ingestion python -m f1_ingest.cli --season 2024
-
-# Verify data in PostgreSQL (planned)
-docker compose exec db psql -U $POSTGRES_USER -d $POSTGRES_DB   -c "SELECT count(*) FROM raw.laps;"
+# Load the first finished race weekend of 2024 (Bahrain Grand Prix, session_key 9472)
+docker compose exec ingestion python -m f1_ingest.cli --season 2024 --meeting-limit 1
 ```
+
+Expected: the log ends with `1 loaded, 0 already loaded, 0 not ready, 0 failed` and the command exits with code 0.
+
+| Option | Meaning |
+|--------|---------|
+| `--season YEAR` or `--session-key KEY` | One of them is required. A season loads its finished sessions; a key loads that one session (it must be finished) |
+| `--mode incremental` (default) | Skip sessions that are already loaded |
+| `--mode full` | Reload every selected session (safe, the writes are upserts) |
+| `--meeting-limit N` | With `--season`: only the first N finished race weekends of the season. The same command twice changes nothing; a larger N adds the new weekends |
+| `--session-type TYPE` | With `--season`, repeatable. Default `Race`, which in OpenF1 includes the Sprint |
+| `--target local` (default) / `cloud` | `cloud` stops with "not implemented yet (final milestone)" |
+
+`python -m f1_ingest.cli --help` lists the same options. Exit code: `0` all sessions ok, `1` at least one session failed (the others are still tried), `2` invalid use, bad configuration or database not reachable.
+
+Verify the result in PostgreSQL:
+
+```bash
+# Rows per table
+docker compose exec db psql -U f1 -d f1_db -c "SELECT 'sessions' AS tbl, count(*) FROM raw.sessions UNION ALL SELECT 'drivers', count(*) FROM raw.drivers UNION ALL SELECT 'laps', count(*) FROM raw.laps UNION ALL SELECT 'stints', count(*) FROM raw.stints UNION ALL SELECT 'pit', count(*) FROM raw.pit;"
+
+# Duplicate keys (the primary keys make them impossible; 0 shows the upserts did not need a second row)
+docker compose exec db psql -U f1 -d f1_db -c "SELECT 'laps' AS tbl, count(*) AS duplicate_keys FROM (SELECT 1 FROM raw.laps GROUP BY session_key, driver_number, lap_number HAVING count(*) > 1) d UNION ALL SELECT 'pit', count(*) FROM (SELECT 1 FROM raw.pit GROUP BY session_key, driver_number, date HAVING count(*) > 1) d;"
+
+# Load log: attempts per session and endpoint
+docker compose exec db psql -U f1 -d f1_db -c "SELECT session_key, endpoint, status, count(*) AS attempts, max(row_count) AS row_count FROM meta.load_log GROUP BY session_key, endpoint, status ORDER BY session_key, min(log_id);"
+
+# Sessions that count as loaded (all five endpoints succeeded)
+docker compose exec db psql -U f1 -d f1_db -c "SELECT session_key FROM meta.load_log WHERE status = 'success' GROUP BY session_key HAVING count(DISTINCT endpoint) = 5;"
+```
+
+Expected after the first command (counts can change if OpenF1 corrects its data):
+
+| tbl | count |
+|-----|-------|
+| sessions | 1 |
+| drivers | 20 |
+| laps | 1129 |
+| stints | 63 |
+| pit | 43 |
+
+`duplicate_keys` is `0` for `laps` and `pit`. The load log has five `success` rows for `9472` (`sessions` 1, `drivers` 20, `laps` 1129, `stints` 63, `pit` 43 rows) and the last query returns `9472`.
+
+**Rerun is safe.** Repeat the first command: it logs `0 loaded, 1 already loaded` and nothing changes. Force a reload and check the queries again:
+
+```bash
+docker compose exec ingestion python -m f1_ingest.cli --season 2024 --meeting-limit 1 --mode full
+```
+
+Expected: `1 loaded`, the same row counts as above, still no duplicate keys, and the load log shows `attempts` 2 for every endpoint of `9472`. Only `_run_id` and `_ingested_at` of the rows change.
+
+**Load only what is new.** Raise the limit to add the second weekend (Saudi Arabian Grand Prix, `9480`):
+
+```bash
+docker compose exec ingestion python -m f1_ingest.cli --season 2024 --meeting-limit 2
+```
+
+Expected: `1 loaded, 1 already loaded`; rows per table: sessions 2, drivers 40, laps 2031, stints 102, pit 62.
+
+**Abort and resume.** Kill a run in the middle of a session (6 seconds after the start), look at the log, then run the same command again:
+
+```bash
+docker compose exec ingestion timeout -s KILL 6 python -m f1_ingest.cli --season 2024 --meeting-limit 3
+docker compose exec db psql -U f1 -d f1_db -c "SELECT endpoint, status, row_count FROM meta.load_log WHERE session_key = 9488 ORDER BY log_id;"
+docker compose exec ingestion python -m f1_ingest.cli --season 2024 --meeting-limit 3
+```
+
+Expected after the kill: the first command prints its progress log and ends with exit code `137` (killed); the endpoints that finished are `success`, the one being loaded is still `running`, later ones are missing (in our run `pit` was `running`). The session `9488` is therefore not loaded. The second run logs `marked 1 unfinished log rows of earlier runs as failed`, reloads `9488` and ends with `1 loaded, 2 already loaded`. Final rows per table: sessions 3, drivers 59, laps 3029, stints 157, pit 98. The log keeps both attempts (`failed` and `success` for `pit`).
+
+Other uses: `--season 2024` loads all 30 Race and Sprint sessions of the season (about 8 seconds each); `--session-key 9472 --mode full` reloads one session. Session keys can be found with `https://api.openf1.org/v1/sessions?year=2024&session_type=Race`. To start from an empty database, run `docker compose down -v` and start again.
 
 ### Ingestion package: lint, tests and OpenF1 smoke run
 
@@ -164,7 +238,17 @@ ruff format --check ingestion
 pytest ingestion
 ```
 
-Expected: `All checks passed!`, `10 files already formatted` and `56 passed`.
+Expected: `All checks passed!`, `18 files already formatted` and `91 passed, 21 deselected`.
+
+The 21 deselected tests are the `integration` tests. They need the compose database and run in a throwaway database (`f1_test_<random>`, created and dropped by the tests, with the unchanged scripts from `db/init/`), so the data in `f1_db` is never touched. Start the database, load the settings from `.env` (its `POSTGRES_HOST=db` only resolves inside the compose network, so override it) and select them with the marker:
+
+```bash
+docker compose up -d db
+set -a; source .env; set +a
+POSTGRES_HOST=localhost pytest ingestion -m integration
+```
+
+Expected: `21 passed, 91 deselected`. If the database is not reachable the tests are skipped with the reason, never failed.
 
 Smoke run against the live OpenF1 API (**needs network**). It fetches all five endpoints for one finished race (2024 Bahrain Grand Prix, `session_key` 9472) with five requests and takes about 10 seconds because of the rate limiter. Settings come from environment variables; if none are set, the defaults from `.env.example` apply.
 
@@ -183,7 +267,7 @@ EOF
 
 Expected last line: `{'sessions': 1, 'drivers': 20, 'laps': 1129, 'stints': 63, 'pit': 43}` (counts can change if OpenF1 corrects its data).
 
-The ingestion image does not contain the package yet; it is installed there together with the CLI (M4). The image never contains the tests (`ingestion/.dockerignore`), they run on the host and later in CI.
+The ingestion image contains the package (installed with its pinned direct dependencies), so the CLI runs with `docker compose exec`. After changing the code, rebuild with `docker compose up -d --build`. The image never contains the tests (`ingestion/.dockerignore`); they run on the host and later in CI.
 
 ### Cloud pipeline (Final milestone)
 
