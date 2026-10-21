@@ -33,3 +33,8 @@ select = ["E", "F", "W", "I", "UP", "B"]
 testpaths = ["tests"]
 # Lets `pytest ingestion` import f1_ingest even without the editable install.
 pythonpath = ["."]
+markers = [
+    "integration: needs the compose Postgres (docker compose up -d db); skipped if unreachable",
+]
+# Plain `pytest ingestion` stays offline; `pytest ingestion -m integration` runs the database tests.
+addopts = '-m "not integration"'
