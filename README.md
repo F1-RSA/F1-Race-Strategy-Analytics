@@ -138,7 +138,9 @@ docker compose exec db psql -U f1 -d f1_db -c "SELECT 1;"
 docker compose exec db psql -U f1 -d f1_db -c "\dt raw.*" -c "\dt meta.*"
 ```
 
-Expected: `f1_postgres` shows `healthy`, `f1_ingestion` shows `Up`, the connection checks print `db reachable` and a single row with `1`, and the last command lists the tables `raw.meetings`, `raw.sessions`, `raw.drivers`, `raw.laps`, `raw.stints`, `raw.pit` and `meta.load_log`. The tables are created by `db/init/` on the first start with an empty volume; see [docs/data_model.md](docs/data_model.md) for the keys.
+Expected: `f1_postgres` shows `healthy`, `f1_ingestion` shows `Up`, the connection checks print `db reachable` and a single row with `1`, and the last command lists the tables `raw.meetings`, `raw.sessions`, `raw.drivers`, `raw.laps`, `raw.stints`, `raw.pit`, `raw.jolpica_races`, `raw.jolpica_results` and `meta.load_log`. The tables are created by `db/init/` on the first start with an empty volume; see [docs/data_model.md](docs/data_model.md) for the keys.
+
+> **Existing databases:** Postgres runs the scripts in `db/init/` only when the data volume is empty. A database created before the Jolpica tables were added (`04_raw_jolpica.sql`) does not have them, and the step-6 check lists only the OpenF1 tables. Recreate it with `docker compose down -v && docker compose up -d --build`; this deletes all loaded data, which a rerun of the ingestion restores.
 
 To stop the services, run `docker compose down`. To also delete the database volume (fresh start), run `docker compose down -v`.
 
