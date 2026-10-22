@@ -1,0 +1,127 @@
+id: f1_weekly_ingestion
+namespace: f1rsa
+
+description: |
+  Loads finished OpenF1 sessions into raw.* of the F1 database.
+  Manual run: choose a season (a session_key, if given, wins over the season).
+  Reruns are safe: the CLI upserts on natural keys and skips sessions that are already loaded.
+
+# One run at a time: the stale-`running` cleanup of the CLI (decisions.md, M4) and the per-process
+# rate limits assume it. A second run waits instead of failing or being dropped.
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: season
+    type: INT
+    required: true
+    defaults: 2024
+    description: Season to load. Ignored when session_key is set.
+  - id: session_key
+    type: INT
+    required: false
+    description: Load only this OpenF1 session.
+  - id: mode
+    type: SELECT
+    values: [incremental, full]
+    defaults: incremental
+    description: incremental skips sessions already loaded; full reloads everything selected.
+  - id: target
+    type: SELECT
+    values: [local]
+    defaults: local
+    description: Only local (PostgreSQL) exists until the cloud milestone.
+  - id: meeting_limit
+    type: INT
+    required: false
+    description: Only the first N race weekends of the season (small test runs and backfills).
+  - id: include_jolpica
+    type: BOOL
+    defaults: true
+    description: Also load the Jolpica race results of the season.
+
+tasks:
+  - id: ingest_openf1
+    type: io.kestra.plugin.docker.cli.Run
+    # Built by docker compose and never pushed to a registry, so it must not be pulled.
+    containerImage: f1-ingestion:local
+    pullPolicy: NEVER
+    # The compose network, so that the host name `db` resolves.
+    networkMode: f1_network
+    env:
+      POSTGRES_HOST: "{{ envs.postgres_host }}"
+      POSTGRES_PORT: "{{ envs.postgres_port }}"
+      POSTGRES_USER: "{{ envs.postgres_user }}"
+      POSTGRES_PASSWORD: "{{ envs.postgres_password }}"
+      POSTGRES_DB: "{{ envs.postgres_db }}"
+    commands:
+      - /bin/sh
+      - -c
+      - >-
+        python -m f1_ingest.cli
+        {{ inputs.session_key is not null ? '--session-key ' ~ inputs.session_key : '--season ' ~ inputs.season }}
+        --mode {{ inputs.mode }}
+        --target {{ inputs.target }}
+        {{ (inputs.meeting_limit is not null and inputs.session_key is null) ? '--meeting-limit ' ~ inputs.meeting_limit : '' }}
+    # A failed attempt only repeats work that is safe to repeat: writes are upserts and a loaded session is skipped.
+    retry:
+      type: exponential
+      interval: PT30S
+      maxInterval: PT5M
+      maxAttempts: 3
+      warningOnRetry: true
+
+  - id: ingest_jolpica
+    type: io.kestra.plugin.docker.cli.Run
+    runIf: "{{ inputs.include_jolpica }}"
+    # Built by docker compose and never pushed to a registry, so it must not be pulled.
+    containerImage: f1-ingestion:local
+    pullPolicy: NEVER
+    # The compose network, so that the host name `db` resolves.
+    networkMode: f1_network
+    env:
+      POSTGRES_HOST: "{{ envs.postgres_host }}"
+      POSTGRES_PORT: "{{ envs.postgres_port }}"
+      POSTGRES_USER: "{{ envs.postgres_user }}"
+      POSTGRES_PASSWORD: "{{ envs.postgres_password }}"
+      POSTGRES_DB: "{{ envs.postgres_db }}"
+    commands:
+      - /bin/sh
+      - -c
+      - python -m f1_ingest.cli --source jolpica --season {{ inputs.season }} --mode {{ inputs.mode }} --target {{ inputs.target }}
+    # A failed attempt only repeats work that is safe to repeat: writes are upserts and a loaded session is skipped.
+    retry:
+      type: exponential
+      interval: PT30S
+      maxInterval: PT5M
+      maxAttempts: 3
+      warningOnRetry: true
+
+  # Only after both loads, so the view is built on what is loaded. A grain failure exits 1 and fails the flow.
+  - id: transform
+    type: io.kestra.plugin.docker.cli.Run
+    # Built by docker compose and never pushed to a registry, so it must not be pulled.
+    containerImage: f1-ingestion:local
+    pullPolicy: NEVER
+    # The compose network, so that the host name `db` resolves.
+    networkMode: f1_network
+    env:
+      POSTGRES_HOST: "{{ envs.postgres_host }}"
+      POSTGRES_PORT: "{{ envs.postgres_port }}"
+      POSTGRES_USER: "{{ envs.postgres_user }}"
+      POSTGRES_PASSWORD: "{{ envs.postgres_password }}"
+      POSTGRES_DB: "{{ envs.postgres_db }}"
+    commands:
+      - python
+      - -m
+      - f1_ingest.transform
+
+triggers:
+  - id: monday_morning
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 * * 1"
+    timezone: UTC
+    # The season in which the run starts; incremental mode picks up whatever finished in the last week.
+    inputs:
+      season: "{{ trigger.date | date('yyyy') }}"
