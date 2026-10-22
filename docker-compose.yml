@@ -20,8 +20,80 @@ services:
     networks:
       - f1_network
 
+  # Kestra's own metadata database: separate service, volume and credentials from the F1 data.
+  kestra_db:
+    image: postgres:16.10
+    container_name: f1_kestra_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${KESTRA_DB_USER:-kestra}
+      POSTGRES_PASSWORD: ${KESTRA_DB_PASSWORD:-kestra_local_dev}
+      POSTGRES_DB: ${KESTRA_DB_NAME:-kestra}
+    volumes:
+      - kestra_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${KESTRA_DB_USER:-kestra} -d ${KESTRA_DB_NAME:-kestra}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - f1_network
+
+  kestra:
+    image: kestra/kestra:v2.0.7
+    container_name: f1_kestra
+    restart: unless-stopped
+    command: server standalone --flow-path /app/flows
+    # Root so that the process may use the Docker socket; see docs/decisions.md (M7) for the risk.
+    user: "root"
+    ports:
+      - "127.0.0.1:${KESTRA_PORT:-8080}:8080"
+    volumes:
+      - kestra_data:/app/storage
+      # Flows are loaded from here at startup (--flow-path); read-only, never edited in the UI.
+      - ./flows:/app/flows:ro
+      # Needed to start the ingestion container for each run. Gives Kestra control of the host's Docker.
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # Values the flow reads as {{ envs.<lowercase name without ENV_> }}; no secrets in the flow YAML.
+      ENV_POSTGRES_HOST: db
+      ENV_POSTGRES_PORT: 5432
+      ENV_POSTGRES_USER: ${POSTGRES_USER}
+      ENV_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      ENV_POSTGRES_DB: ${POSTGRES_DB}
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://kestra_db:5432/${KESTRA_DB_NAME:-kestra}
+            driverClassName: org.postgresql.Driver
+            username: ${KESTRA_DB_USER:-kestra}
+            password: ${KESTRA_DB_PASSWORD:-kestra_local_dev}
+        kestra:
+          server:
+            basicAuth:
+              username: ${KESTRA_USER:-admin@kestra.local}
+              password: ${KESTRA_PASSWORD:-Kestra_local_dev1}
+          repository:
+            type: postgres
+          queue:
+            type: postgres
+          storage:
+            type: local
+            local:
+              basePath: /app/storage
+          url: http://localhost:${KESTRA_PORT:-8080}/
+    depends_on:
+      kestra_db:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    networks:
+      - f1_network
+
   ingestion:
     build: ./ingestion
+    # Fixed name: Kestra starts containers from this image (flows/), compose builds it.
+    image: f1-ingestion:local
     container_name: f1_ingestion
     restart: unless-stopped
     env_file: .env
@@ -33,7 +105,11 @@ services:
 
 volumes:
   pgdata:
+  kestra_pgdata:
+  kestra_data:
 
 networks:
   f1_network:
+    # Fixed name (not <project>_f1_network): containers that Kestra starts attach to it by name.
+    name: f1_network
     driver: bridge
