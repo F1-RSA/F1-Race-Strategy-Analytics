@@ -55,7 +55,7 @@ See [`docs/f1_pipeline_arch_v01.svg`](docs/f1_pipeline_arch_v01.svg) for the ful
 | `dim_circuits` | One circuit | `circuit_key`, `circuit_name`, `location`, `country` |
 | `dim_sessions` | One race weekend session | `session_key`, `session_type`, `meeting_key`, `date_start` |
 
-> ¹ `compound` and `tyre_age_laps` are not present in the OpenF1 `/laps` endpoint. They are derived by joining laps with the `/stints` endpoint on `(session_key, driver_number, lap_number BETWEEN lap_start AND lap_end)`.
+> ¹ `compound` and `tyre_age_laps` are not present in the OpenF1 `/laps` endpoint. They are derived by joining laps with the `/stints` endpoint on `(session_key, driver_number, lap_number BETWEEN lap_start AND lap_end)`. The midterm implements this as the view `core.laps_enriched`; the overlap rule is in [docs/data_model.md](docs/data_model.md).
 >
 > ² `compound_in` and `compound_out` are also not present in the OpenF1 `/pit` endpoint. They are derived from the stints preceding and following each pit stop.
 >
@@ -91,19 +91,22 @@ F1-Race-Strategy-Analytics/
 │   │   ├── jolpica_load.py     # Jolpica load: schedule, completed rounds, one row per result
 │   │   ├── openf1.py           # OpenF1 client: session listing, drivers, laps, stints, pit
 │   │   ├── pipeline.py         # Session selection (incremental, unfinished) and per-session load
+│   │   ├── transform.py        # Builds core.laps_enriched, grain and coverage checks
+│   │   ├── sql/                # SQL of the transformation (installed with the package)
 │   │   ├── state.py            # meta.load_log: attempts and the "loaded" rule
 │   │   └── sinks/postgres.py   # Upsert into raw.* on the natural keys
 │   └── tests/                  # Offline tests, plus `integration` tests that need the compose db
 ├── docs/
-│   ├── data_model.md                 # Schemas, keys and the load log
+│   ├── data_model.md                 # Schemas, keys, the load log and core.laps_enriched
+│   ├── queries/                      # Example queries with real results
 │   ├── decisions.md                  # Decision log per work package
 │   ├── f1_pipeline_arch_v01.svg      # Architecture v0.1
 │   └── sample_data/                  # Raw API sample responses (CSV)
-├── flows/, sql/                # Empty placeholders for orchestration and transformation
+├── flows/, sql/                # Empty placeholders (flows: Kestra, M7; the transformation SQL lives in ingestion/f1_ingest/sql/)
 └── img/                        # Logo and banner used in the README
 ```
 
-The transformation, Kestra flows and Terraform are added in later work packages (see backlog).
+The dbt models, the Kestra flows and Terraform are added in later work packages (see backlog).
 
 ---
 
@@ -165,6 +168,7 @@ Expected: the log ends with `1 loaded, 0 already loaded, 0 not ready, 0 failed` 
 | `--mode full` | Reload every selected session (safe, the writes are upserts) |
 | `--meeting-limit N` | With `--season`: only the first N finished race weekends of the season. The same command twice changes nothing; a larger N adds the new weekends |
 | `--session-type TYPE` | With `--season`, repeatable. Default `Race`, which in OpenF1 includes the Sprint |
+| `--transform` | After loading OpenF1 data, build `core.laps_enriched` and run its checks, see [below](#transform-lap-stint-join-and-checks) |
 | `--target local` (default) / `cloud` | `cloud` stops with "not implemented yet (final milestone)" |
 
 `python -m f1_ingest.cli --help` lists the same options. Exit code: `0` all sessions ok, `1` at least one session failed (the others are still tried), `2` invalid use, bad configuration or database not reachable.
@@ -270,6 +274,60 @@ docker compose exec ingestion python -m f1_ingest.cli --source jolpica --season 
 
 Which unit counts as loaded is recorded in `meta.load_log` (`source = 'jolpica'`): the unit is part of the `endpoint` text, `races:2024`, `results:2024` (the paginated fetch) and `results:2024:7` (round 7, written together with its rows).
 
+### Transform: lap-stint join and checks
+
+OpenF1's `/laps` has no tyre compound; `/stints` has it per lap range. The transformation joins them into the view `core.laps_enriched` (one row per lap, typed columns: lap time, compound, stint, tyre age in laps, pit-out and lap-time flags) and checks the result. Columns and the join rule are in [docs/data_model.md](docs/data_model.md). The view needs no data of its own, so running the transform again is always safe.
+
+```bash
+# Load three race weekends of 2024 (Bahrain, Saudi Arabia, Australia) and run the transform
+docker compose exec ingestion python -m f1_ingest.cli --season 2024 --meeting-limit 3 --transform
+
+# The transform alone (after any load, repeatable)
+docker compose exec ingestion python -m f1_ingest.transform
+```
+
+Expected: the log ends with the checks and the command exits with code 0:
+
+```
+grain check passed: 3029 laps, no duplicate key
+coverage session 9472: 1129 laps, 0 without stint (0.00 %), 0 without known compound, 0 without tyre age, 0 without lap time
+coverage session 9480: 902 laps, 2 without stint (0.22 %), 2 without known compound, 2 without tyre age, 2 without lap time
+coverage session 9488: 998 laps, 3 without stint (0.30 %), 3 without known compound, 3 without tyre age, 4 without lap time
+coverage total: 3029 laps, 5 without stint (0.17 %), 5 without known compound, 5 without tyre age, 6 without lap time
+```
+
+- **Grain check:** no lap appears twice and the view has as many rows as `raw.laps`. A failure is logged as an error and the exit code is `1`.
+- **Coverage report:** laps without a stint, known compound, tyre age and lap time, per session and in total. It never fails the run; it warns if more than 2 % of the laps of a session have no stint.
+
+Verify in PostgreSQL:
+
+```bash
+# Same number of rows as raw.laps (3029 and 3029)
+docker compose exec db psql -U f1 -d f1_db -c "SELECT (SELECT count(*) FROM core.laps_enriched) AS laps_enriched, (SELECT count(*) FROM raw.laps) AS raw_laps;"
+
+# Laps that have a stint but no compound or tyre age (0)
+docker compose exec db psql -U f1 -d f1_db -c "SELECT count(*) AS laps_with_stint_but_null FROM core.laps_enriched WHERE stint_number IS NOT NULL AND (compound IS NULL OR tyre_age_laps IS NULL);"
+
+# Why the join takes the earliest stint: laps that a plain BETWEEN join returns twice (0, 0 and 36)
+docker compose exec db psql -U f1 -d f1_db -c "SELECT l.session_key, count(*) - count(DISTINCT (l.driver_number, l.lap_number)) AS laps_returned_twice FROM raw.laps l JOIN raw.stints s ON s.session_key = l.session_key AND s.driver_number = l.driver_number AND l.lap_number BETWEEN (s.payload->>'lap_start')::int AND (s.payload->>'lap_end')::int GROUP BY 1 ORDER BY 1;"
+
+# One of those laps: driver 27, Australia. Stint 1 ends and stint 2 starts on lap 17; lap 17 stays HARD
+docker compose exec db psql -U f1 -d f1_db -c "SELECT lap_number, stint_number, compound, tyre_age_laps, is_pit_out_lap FROM core.laps_enriched WHERE session_key = 9488 AND driver_number = 27 AND lap_number BETWEEN 15 AND 19 ORDER BY lap_number;"
+```
+
+Expected: `3029 | 3029`; `0`; `0, 0, 36` for 9472, 9480 and 9488; and for driver 27 laps 15 to 17 `HARD` (stint 1, tyre age 14 to 16), laps 18 and 19 `MEDIUM` (stint 2, tyre age 1 and 2, lap 18 is the pit-out lap).
+
+The example queries for the use case are in [docs/queries/](docs/queries/): average lap time by compound and tyre age, and degradation per stint. Each file has its explanation and the real result. Run one with `docker compose exec -T db psql -U f1 -d f1_db < docs/queries/degradation_per_stint.sql`.
+
+**Rerun is safe.** Run the transform again: the counts, the compounds and the sums stay the same.
+
+```bash
+docker compose exec ingestion python -m f1_ingest.transform
+docker compose exec db psql -U f1 -d f1_db -c "SELECT count(*) AS laps, count(compound) AS with_compound, sum(tyre_age_laps) AS tyre_age_sum FROM core.laps_enriched;"
+```
+
+Expected: `3029 | 3024 | 37878`, as after the first run.
+
 ### Ingestion package: lint, tests and OpenF1 smoke run
 
 The ingestion package runs on the host in a virtual environment. Run all commands from the repository root (on Windows, activate with `.venv\Scripts\activate`).
@@ -321,7 +379,7 @@ The ingestion image contains the package (installed with its pinned direct depen
 
 ### Cloud pipeline (Final milestone)
 
-> Planned — the Terraform code and ingestion scripts are not yet in the repository.
+> Planned — the Terraform code and the cloud sink are not yet in the repository.
 
 ```bash
 # Provision GCS bucket and BigQuery dataset
