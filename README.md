@@ -76,7 +76,7 @@ See [`docs/f1_pipeline_arch_v01.svg`](docs/f1_pipeline_arch_v01.svg) for the ful
 ```
 F1-Race-Strategy-Analytics/
 ├── README.md
-├── docker-compose.yml          # PostgreSQL and the ingestion container on one network
+├── docker-compose.yml          # PostgreSQL, Kestra (with its own database) and the ingestion image on one network
 ├── .env.example                # All configuration; the defaults work unchanged
 ├── .gitignore
 ├── db/init/                    # Schema scripts (schemas, raw tables, load log), run on first start
@@ -102,11 +102,13 @@ F1-Race-Strategy-Analytics/
 │   ├── decisions.md                  # Decision log per work package
 │   ├── f1_pipeline_arch_v01.svg      # Architecture v0.1
 │   └── sample_data/                  # Raw API sample responses (CSV)
-├── flows/, sql/                # Empty placeholders (flows: Kestra, M7; the transformation SQL lives in ingestion/f1_ingest/sql/)
+├── flows/
+│   └── f1_weekly_ingestion.yml       # Kestra flow, loaded automatically at startup
+├── sql/                        # Empty placeholder (the transformation SQL lives in ingestion/f1_ingest/sql/)
 └── img/                        # Logo and banner used in the README
 ```
 
-The dbt models, the Kestra flows and Terraform are added in later work packages (see backlog).
+The dbt models and Terraform are added in later work packages (see backlog).
 
 ---
 
@@ -143,7 +145,7 @@ docker compose exec db psql -U f1 -d f1_db -c "SELECT 1;"
 docker compose exec db psql -U f1 -d f1_db -c "\dt raw.*" -c "\dt meta.*"
 ```
 
-Expected: `f1_postgres` shows `healthy`, `f1_ingestion` shows `Up`, the connection checks print `db reachable` and a single row with `1`, and the last command lists the tables `raw.meetings`, `raw.sessions`, `raw.drivers`, `raw.laps`, `raw.stints`, `raw.pit`, `raw.jolpica_races`, `raw.jolpica_results` and `meta.load_log`. The tables are created by `db/init/` on the first start with an empty volume; see [docs/data_model.md](docs/data_model.md) for the keys.
+Expected: `f1_postgres` and `f1_kestra_postgres` show `healthy`, `f1_kestra` and `f1_ingestion` show `Up` (the first start pulls the Kestra image, about 4 GB; allow a few minutes), the connection checks print `db reachable` and a single row with `1`, and the last command lists the tables `raw.meetings`, `raw.sessions`, `raw.drivers`, `raw.laps`, `raw.stints`, `raw.pit`, `raw.jolpica_races`, `raw.jolpica_results` and `meta.load_log`. The tables are created by `db/init/` on the first start with an empty volume; see [docs/data_model.md](docs/data_model.md) for the keys.
 
 > **Existing databases:** Postgres runs the scripts in `db/init/` only when the data volume is empty. A database created before the Jolpica tables were added (`04_raw_jolpica.sql`) does not have them, and the step-6 check lists only the OpenF1 tables. Recreate it with `docker compose down -v && docker compose up -d --build`; this deletes all loaded data, which a rerun of the ingestion restores.
 
@@ -396,12 +398,65 @@ docker compose run ingestion python -m f1_ingest.cli --season 2024 --target clou
 
 ## Orchestration
 
-The pipeline is scheduled to run every Monday at 06:00 UTC using Kestra, covering any race weekends from the previous 7 days. The flow:
-1. Fetches the current race calendar to identify new `session_key` values.
-2. Runs incremental ingestion for each new session (OpenF1 + Jolpica).
-3. Uploads raw JSON to GCS.
-4. Triggers SQL transformations to update curated tables in BigQuery.
-5. On failure: retries up to 3 times with exponential backoff; alerts are logged.
+Kestra runs the pipeline. The flow [`flows/f1_weekly_ingestion.yml`](flows/f1_weekly_ingestion.yml) is mounted into the Kestra container and loaded at startup (`server standalone --flow-path /app/flows`), so nothing is created by hand in the UI. Kestra keeps its own metadata in a separate Postgres (`kestra_db`); the F1 data stays in `db`.
+
+Every run starts three one-shot containers from the ingestion image (`f1-ingestion:local`) on the compose network `f1_network`, so the host name `db` resolves:
+
+1. `ingest_openf1`: `python -m f1_ingest.cli --season <season> --mode <mode> [--meeting-limit N]` (or `--session-key`).
+2. `ingest_jolpica`: `python -m f1_ingest.cli --source jolpica --season <season>` (skipped if `include_jolpica` is off).
+3. `transform`: `python -m f1_ingest.transform` rebuilds `core.laps_enriched` and runs its checks.
+
+| Input | Default | Meaning |
+|-------|---------|---------|
+| `season` | 2024 | Season to load (ignored if `session_key` is set) |
+| `session_key` | empty | Load only this OpenF1 session |
+| `mode` | `incremental` | `incremental` skips what is loaded, `full` reloads and overwrites |
+| `target` | `local` | Only `local` exists until the cloud milestone |
+| `meeting_limit` | empty | Only the first N race weekends (small test runs, backfill) |
+| `include_jolpica` | on | Also load the Jolpica race results |
+
+**Schedule:** every Monday 06:00 UTC with the season of that day and `mode=incremental`, so it loads what finished since the last run. **Concurrency:** one run at a time, a second one waits in the queue. **Retries:** each load task is tried up to 3 times with exponential backoff (30 s, then 60 s). If a task still fails, the flow ends `FAILED` and `transform` does not run.
+
+### Start Kestra and run the flow
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+docker compose ps
+```
+
+Open http://localhost:8080 and log in with the local-development values from `.env` (`KESTRA_USER` / `KESTRA_PASSWORD`, default `admin@kestra.local` / `Kestra_local_dev1`). Under **Flows** the namespace `f1rsa` holds `f1_weekly_ingestion`; Kestra also lists its own `tutorial` example flows, ignore them.
+
+**Manual run:** open the flow, click **Execute**, enter `season` = 2024 and `meeting_limit` = 1, click **Execute**. Expected: the three tasks turn green (first run: OpenF1 about 10 s for one weekend, Jolpica between 40 seconds and 3.5 minutes because of its rate limit). The same run from the command line:
+
+```bash
+curl -s -u admin@kestra.local:Kestra_local_dev1 -X POST \
+  http://127.0.0.1:8080/api/v1/main/executions/f1rsa/f1_weekly_ingestion \
+  -F season=2024 -F meeting_limit=1
+```
+
+**Rerun:** execute the flow again with the same inputs. Expected: green, the OpenF1 log says `0 loaded, 1 already loaded`, Jolpica `0 rounds loaded, 24 already loaded`, and the counts below stay the same. `mode` = `full` rewrites the rows instead of skipping them and still leaves the counts unchanged.
+
+**Backfill of a past season:** execute with `season` = 2023, `mode` = `incremental`. Add `meeting_limit` = 1 to try it on one weekend; leave it empty for the whole season (about 30 sessions, a few minutes; Jolpica adds up to 3.5 minutes). Running it again loads only what is missing.
+
+Check the result in the database:
+
+```bash
+docker compose exec db psql -U f1 -d f1_db -c "
+SELECT 'raw.sessions' AS t, count(*) FROM raw.sessions UNION ALL
+SELECT 'raw.laps', count(*) FROM raw.laps UNION ALL
+SELECT 'raw.stints', count(*) FROM raw.stints UNION ALL
+SELECT 'raw.pit', count(*) FROM raw.pit UNION ALL
+SELECT 'raw.jolpica_results', count(*) FROM raw.jolpica_results UNION ALL
+SELECT 'core.laps_enriched', count(*) FROM core.laps_enriched;"
+docker compose exec db psql -U f1 -d f1_db -c "SELECT source, split_part(endpoint, ':', 1) AS endpoint, status, count(*) FROM meta.load_log GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;"
+```
+
+Expected on a fresh database after `season` = 2024 with `meeting_limit` = 1 (and unchanged after a rerun): `raw.sessions` 1, `raw.laps` 1129, `raw.stints` 63, `raw.pit` 43, `raw.jolpica_results` 479, `core.laps_enriched` 1129. A backfill of 2023 with `meeting_limit` = 1 then gives 2 sessions, 2187 laps, 133 stints, 43 pit rows (the 2023 weekend has none in OpenF1), 919 Jolpica results and 2187 rows in `core.laps_enriched`; running it again changes nothing. The load log shows `success` rows only.
+
+![A successful Kestra run](docs/kestra_run_success.png)
+
+**Changing the flow:** edit `flows/f1_weekly_ingestion.yml` and run `docker compose restart kestra`; flows are loaded at startup only. **Docker socket:** Kestra needs `/var/run/docker.sock` to start the ingestion containers, which gives it control of the host's Docker. That is acceptable for a local setup and is the reason the UI is bound to `127.0.0.1`; see `docs/decisions.md` (M7). Log lines from the CLI appear with level ERROR in Kestra because Python logs to stderr; the task state is what counts.
 
 ---
 
