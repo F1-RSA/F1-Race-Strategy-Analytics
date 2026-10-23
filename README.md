@@ -36,11 +36,30 @@
 
 ---
 
-## Architecture v0.1
+## Architecture v0.2
 
-![Architecture v0.1](docs/f1_pipeline_arch_v01.svg)
+![Architecture v0.2](docs/f1_pipeline_arch_v02.svg)
 
-See [`docs/f1_pipeline_arch_v01.svg`](docs/f1_pipeline_arch_v01.svg) for the full diagram.
+[`docs/f1_pipeline_arch_v02.svg`](docs/f1_pipeline_arch_v02.svg) shows what runs at the midterm (solid) and what is planned for the final milestone (dashed). The pitch version stays in [`docs/f1_pipeline_arch_v01.svg`](docs/f1_pipeline_arch_v01.svg).
+
+### Changes since v0.1
+
+Every row comes from an entry in [docs/decisions.md](docs/decisions.md).
+
+| Change | Why | Decided in |
+|--------|-----|------------|
+| "Python batch scripts" became the package `f1_ingest` with one CLI (`--source`, `--season` / `--session-key`, `--mode`, `--meeting-limit`, `--target`) and one shared HTTP layer (token bucket, retry with backoff and jitter, `Retry-After`) | One place for rate limits and retries, testable without network | M2, M4 |
+| OpenF1 is throttled to 24 requests per minute, not the 30 of the plan | OpenF1 documents no limit and sends no rate-limit headers, so the client stays conservative; configurable | M2 |
+| PostgreSQL got the schemas `raw`, `core` and `meta`; raw tables keep the unchanged JSON (`payload`) next to the natural key | An API change must not break the load; upserts on the key make reruns safe | M3 |
+| Incremental loading is "sessions OpenF1 lists minus sessions with five successful endpoint rows in `meta.load_log`"; only finished sessions are loaded; default session types are Race and Sprint | A session counts as loaded only when complete; saves backfill time | M4 |
+| The Jolpica client loads one season per run with pagination (100 rows per page, border inside a race) into `raw.jolpica_races` and `raw.jolpica_results` | About 6 requests per season instead of 24 or more; no lost or duplicated rows at page borders | M5 |
+| "laps + stints → compound" became the view `core.laps_enriched`: each lap gets the earliest stint that covers it; grain and coverage checks run after every load | A plain join returns pit-stop laps twice; a view is always consistent and needs nothing to schedule | M6 |
+| Kestra is concrete: flow `f1_weekly_ingestion` (OpenF1, Jolpica, transform), loaded from `flows/` at startup, Monday 06:00 UTC, retries, one run at a time, inputs for backfill | Visible runs, retries and a queue instead of cron; backfill is a manual run with a season | M7 |
+| Kestra has its own metadata database (`kestra_db`) and starts one-shot containers from `f1-ingestion:local` on the compose network `f1_network` through the Docker socket | Orchestration state is separate from the data; the containers must reach `db` by name | M1, M7 |
+| `--target cloud` exists but stops with "not implemented yet" | The cloud sink belongs to the final milestone | M4 |
+| GitHub Actions workflow runs ruff, the offline tests and the integration tests against a PostgreSQL service | Every push is checked the same way as on a laptop | M8 |
+
+Unchanged from v0.1: Cloud Storage as the data lake, BigQuery with dbt for the curated tables, Terraform and the analytics layer. None of them exists in the repository yet.
 
 ---
 
@@ -498,4 +517,4 @@ Expected on a fresh database after `season` = 2024 with `meeting_limit` = 1 (and
 
 ---
 
-*Architecture v0.1 – 01.10.2026 | Subject to revision after implementation experience*
+*Architecture v0.2 – 22.10.2026 (midterm) | Subject to revision for the final milestone*
