@@ -31,16 +31,35 @@
 **Known risks:**
 - Both APIs are unofficial, community-maintained projects — availability is not guaranteed.
 - Schemas may change without notice.
-- Rate limits: OpenF1 neither documents a limit nor sends rate-limit headers (checked 2026-10-19), so the client throttles itself to 24 req/min (configurable). Jolpica allows 4 req/s and 500 req/h (to be verified in M5).
+- Rate limits: OpenF1 neither documents a limit nor sends rate-limit headers (checked 2026-10-19), so the client throttles itself to 24 req/min (configurable). Jolpica documents 4 req/s and 500 req/h and announces lower limits, so the client uses 6 req/min (configurable).
 - Lap time data may be missing for DNFs, Safety Car periods, or red-flagged sessions.
 
 ---
 
-## Architecture v0.1
+## Architecture v0.2
 
-![Architecture v0.1](docs/f1_pipeline_arch_v01.svg)
+![Architecture v0.2](docs/f1_pipeline_arch_v02.svg)
 
-See [`docs/f1_pipeline_arch_v01.svg`](docs/f1_pipeline_arch_v01.svg) for the full diagram.
+[`docs/f1_pipeline_arch_v02.svg`](docs/f1_pipeline_arch_v02.svg) shows what runs at the midterm (solid) and what is planned for the final milestone (dashed). The pitch version stays in [`docs/f1_pipeline_arch_v01.svg`](docs/f1_pipeline_arch_v01.svg).
+
+### Changes since v0.1
+
+Every row comes from an entry in [docs/decisions.md](docs/decisions.md).
+
+| Change | Why | Decided in |
+|--------|-----|------------|
+| "Python batch scripts" became the package `f1_ingest` with one CLI (`--source`, `--season` / `--session-key`, `--mode`, `--meeting-limit`, `--target`) and one shared HTTP layer (token bucket, retry with backoff and jitter, `Retry-After`) | One place for rate limits and retries, testable without network | M2, M4 |
+| OpenF1 is throttled to 24 requests per minute, not the 30 of the plan | OpenF1 documents no limit and sends no rate-limit headers, so the client stays conservative; configurable | M2 |
+| PostgreSQL got the schemas `raw`, `core` and `meta`; raw tables keep the unchanged JSON (`payload`) next to the natural key | An API change must not break the load; upserts on the key make reruns safe | M3 |
+| Incremental loading is "sessions OpenF1 lists minus sessions with five successful endpoint rows in `meta.load_log`"; only finished sessions are loaded; default session types are Race and Sprint | A session counts as loaded only when complete; saves backfill time | M4 |
+| The Jolpica client loads one season per run with pagination (100 rows per page, border inside a race) into `raw.jolpica_races` and `raw.jolpica_results` | About 6 requests per season instead of 24 or more; no lost or duplicated rows at page borders | M5 |
+| "laps + stints → compound" became the view `core.laps_enriched`: each lap gets the earliest stint that covers it; grain and coverage checks run after every load | A plain join returns pit-stop laps twice; a view is always consistent and needs nothing to schedule | M6 |
+| Kestra is concrete: flow `f1_weekly_ingestion` (OpenF1, Jolpica, transform), loaded from `flows/` at startup, Monday 06:00 UTC, retries, one run at a time, inputs for backfill | Visible runs, retries and a queue instead of cron; backfill is a manual run with a season | M7 |
+| Kestra has its own metadata database (`kestra_db`) and starts one-shot containers from `f1-ingestion:local` on the compose network `f1_network` through the Docker socket | Orchestration state is separate from the data; the containers must reach `db` by name | M1, M7 |
+| `--target cloud` exists but stops with "not implemented yet" | The cloud sink belongs to the final milestone | M4 |
+| GitHub Actions workflow runs ruff, the offline tests and the integration tests against a PostgreSQL service | Every push is checked the same way as on a laptop | M8 |
+
+Unchanged from v0.1: Cloud Storage as the data lake, BigQuery with dbt for the curated tables, Terraform and the analytics layer. None of them exists in the repository yet.
 
 ---
 
@@ -65,9 +84,9 @@ See [`docs/f1_pipeline_arch_v01.svg`](docs/f1_pipeline_arch_v01.svg) for the ful
 
 ## Ingestion strategy
 
-**Full load (backfill):** On first run, load all available sessions from 2023 to present.  
-**Incremental load:** After each race weekend, load only new `session_key` values not yet present in the database. Idempotency is ensured by upserting on the natural key of each raw table (for laps `(session_key, driver_number, lap_number)`).  
-**Failure handling:** Failed session loads are logged and retried by the Kestra workflow on next run. Partial loads do not corrupt existing data.
+**Full load (backfill):** One season per run: `--season 2023` (CLI) or the Kestra input `season`. A season is about 30 Race and Sprint sessions and takes a few minutes; loading 2023 to today means one run per season.  
+**Incremental load:** After each race weekend, load only the finished sessions that are not yet loaded (`--mode incremental`, the default). "Loaded" means all five endpoints have a `success` row in `meta.load_log`. Idempotency is ensured by upserting on the natural key of each raw table (for laps `(session_key, driver_number, lap_number)`).  
+**Failure handling:** A failed session is logged and the other sessions are still tried (exit code 1). Kestra repeats a failed task up to 3 times with backoff and ends the flow `FAILED` if it still fails; the next run loads exactly the sessions that are missing. Partial loads do not corrupt existing data: every endpoint of a session is written in one transaction.
 
 ---
 
@@ -79,6 +98,7 @@ F1-Race-Strategy-Analytics/
 ├── docker-compose.yml          # PostgreSQL, Kestra (with its own database) and the ingestion image on one network
 ├── .env.example                # All configuration; the defaults work unchanged
 ├── .gitignore
+├── .github/workflows/ci.yml    # ruff, offline tests and integration tests on every push and pull request
 ├── db/init/                    # Schema scripts (schemas, raw tables, load log), run on first start
 ├── ingestion/
 │   ├── Dockerfile              # Image with the package installed; stays idle for docker compose exec
@@ -100,7 +120,9 @@ F1-Race-Strategy-Analytics/
 │   ├── data_model.md                 # Schemas, keys, the load log and core.laps_enriched
 │   ├── queries/                      # Example queries with real results
 │   ├── decisions.md                  # Decision log per work package
-│   ├── f1_pipeline_arch_v01.svg      # Architecture v0.1
+│   ├── f1_pipeline_arch_v01.svg      # Architecture v0.1 (pitch)
+│   ├── f1_pipeline_arch_v02.svg      # Architecture v0.2 (midterm)
+│   ├── kestra_run_success.png        # Screenshot of a successful Kestra run
 │   └── sample_data/                  # Raw API sample responses (CSV)
 ├── flows/
 │   └── f1_weekly_ingestion.yml       # Kestra flow, loaded automatically at startup
@@ -108,7 +130,7 @@ F1-Race-Strategy-Analytics/
 └── img/                        # Logo and banner used in the README
 ```
 
-The dbt models and Terraform are added in later work packages (see backlog).
+`terraform/`, `transformation/dbt/` and the cloud sink do not exist yet; they belong to the final milestone (see backlog).
 
 ---
 
@@ -116,12 +138,18 @@ The dbt models and Terraform are added in later work packages (see backlog).
 
 ### Prerequisites
 
-- Docker and Docker Compose
-- Python 3.11+ (to run the ingestion tests on the host; if `python3 --version` is older, use `python3.11`)
-- Google Cloud project with billing enabled (for final milestone)
-- Terraform ≥ 1.5 (for final milestone)
+- Docker with Docker Compose v2 (`docker compose version`), running. Docker Desktop on macOS and Windows, Docker Engine on Linux.
+- About 10 GB of free disk space: the Kestra image alone is about 4 GB (see [Troubleshooting](#troubleshooting) if Docker Desktop reports a read-only file system while pulling it).
+- Internet access: Docker Hub and the two public APIs (OpenF1, Jolpica).
+- Free ports `5432` (PostgreSQL) and `8080` (Kestra UI) on `127.0.0.1`; both can be changed in `.env`.
+- Python 3.11+ only to run the lint and tests on the host (if `python3 --version` is older, use `python3.11`).
+- Terraform and a Google Cloud project are needed only for the final milestone, not for anything in this guide.
 
-### Local pipeline (Milestone 1 / Midterm)
+The commands were run on macOS with Docker Desktop. Linux and Windows are described in [Troubleshooting](#troubleshooting) but not tested by us.
+
+### Quick path: one race weekend in about 10 minutes
+
+The first start pulls the Kestra image (about 4 GB); with a warm image cache the whole path takes under 2 minutes. If you only need the database and the CLI, `docker compose up -d --build db ingestion` skips that pull.
 
 ```bash
 # 1. Clone the repository
@@ -134,22 +162,68 @@ cp .env.example .env
 # 3. Build and start all services
 docker compose up -d --build
 
-# 4. Check that everything is healthy
+# 4. Check that everything is up
 docker compose ps
-
-# 5. Verify the database connection from inside the network
-docker compose exec ingestion python -c "import socket; socket.create_connection(('db', 5432), 3); print('db reachable')"
-docker compose exec db psql -U f1 -d f1_db -c "SELECT 1;"
-
-# 6. Check that the schema was created
-docker compose exec db psql -U f1 -d f1_db -c "\dt raw.*" -c "\dt meta.*"
 ```
 
-Expected: `f1_postgres` and `f1_kestra_postgres` show `healthy`, `f1_kestra` and `f1_ingestion` show `Up` (the first start pulls the Kestra image, about 4 GB; allow a few minutes), the connection checks print `db reachable` and a single row with `1`, and the last command lists the tables `raw.meetings`, `raw.sessions`, `raw.drivers`, `raw.laps`, `raw.stints`, `raw.pit`, `raw.jolpica_races`, `raw.jolpica_results` and `meta.load_log`. The tables are created by `db/init/` on the first start with an empty volume; see [docs/data_model.md](docs/data_model.md) for the keys.
+Expected: `f1_postgres` and `f1_kestra_postgres` show `healthy`; `f1_kestra` and `f1_ingestion` show `Up` (Kestra has no health check; its UI needs another 30 to 60 seconds, see the Kestra path below).
 
-> **Existing databases:** Postgres runs the scripts in `db/init/` only when the data volume is empty. A database created before the Jolpica tables were added (`04_raw_jolpica.sql`) does not have them, and the step-6 check lists only the OpenF1 tables. Recreate it with `docker compose down -v && docker compose up -d --build`; this deletes all loaded data, which a rerun of the ingestion restores.
+```bash
+# 5. Check the connection from inside the network and the schema created by db/init/
+docker compose exec ingestion python -c "import socket; socket.create_connection(('db', 5432), 3); print('db reachable')"
+docker compose exec db psql -U f1 -d f1_db -c "SELECT 1;" -c "\dt raw.*" -c "\dt meta.*"
+```
 
-To stop the services, run `docker compose down`. To also delete the database volume (fresh start), run `docker compose down -v`.
+Expected: `db reachable`, one row with `1`, and the tables `raw.drivers`, `raw.jolpica_races`, `raw.jolpica_results`, `raw.laps`, `raw.meetings`, `raw.pit`, `raw.sessions`, `raw.stints` and `meta.load_log`.
+
+```bash
+# 6. Load the first finished race weekend of 2024 (Bahrain, session_key 9472) and run the transform
+docker compose exec ingestion python -m f1_ingest.cli --season 2024 --meeting-limit 1 --transform
+```
+
+Expected (about 10 seconds, exit code 0; the timestamps and the run id differ):
+
+```
+... f1_ingest.pipeline: session 9472 loaded
+... f1_ingest: run <id> finished: 1 loaded, 0 already loaded, 0 not ready, 0 failed
+... f1_ingest.transform: core.laps_enriched created or replaced
+... f1_ingest.transform: grain check passed: 1129 laps, no duplicate key
+... f1_ingest.transform: coverage session 9472: 1129 laps, 0 without stint (0.00 %), 0 without known compound, 0 without tyre age, 0 without lap time
+... f1_ingest.transform: coverage total: 1129 laps, 0 without stint (0.00 %), 0 without known compound, 0 without tyre age, 0 without lap time
+```
+
+```bash
+# 7. Verify in PostgreSQL
+docker compose exec db psql -U f1 -d f1_db -c "SELECT 'sessions' AS tbl, count(*) FROM raw.sessions UNION ALL SELECT 'drivers', count(*) FROM raw.drivers UNION ALL SELECT 'laps', count(*) FROM raw.laps UNION ALL SELECT 'stints', count(*) FROM raw.stints UNION ALL SELECT 'pit', count(*) FROM raw.pit;"
+docker compose exec db psql -U f1 -d f1_db -c "SELECT (SELECT count(*) FROM core.laps_enriched) AS laps_enriched, (SELECT count(*) FROM raw.laps) AS raw_laps;"
+docker compose exec db psql -U f1 -d f1_db -c "SELECT count(*) AS laps, count(compound) AS with_compound, sum(tyre_age_laps) AS tyre_age_sum FROM core.laps_enriched;"
+docker compose exec db psql -U f1 -d f1_db -c "SELECT session_key, endpoint, status, count(*) AS attempts, max(row_count) AS row_count FROM meta.load_log WHERE source = 'openf1' GROUP BY session_key, endpoint, status ORDER BY session_key, min(log_id);"
+```
+
+Expected:
+
+| tbl | count |
+|-----|-------|
+| sessions | 1 |
+| drivers | 20 |
+| laps | 1129 |
+| stints | 63 |
+| pit | 43 |
+
+then `laps_enriched` 1129 and `raw_laps` 1129; `laps` 1129, `with_compound` 1129, `tyre_age_sum` 10943; and five `success` rows for session `9472` (`sessions` 1, `drivers` 20, `laps` 1129, `stints` 63, `pit` 43 rows, one attempt each). The counts can change if OpenF1 corrects its data.
+
+```bash
+# 8. Rerun: nothing is loaded again and no count changes
+docker compose exec ingestion python -m f1_ingest.cli --season 2024 --meeting-limit 1 --transform
+```
+
+Expected (about 1 second): `0 loaded, 1 already loaded, 0 not ready, 0 failed` and the same `grain check passed: 1129 laps`. Repeat step 7: the numbers are identical.
+
+Optional, the race results from Jolpica (40 seconds to 3.5 minutes because of the rate limit): `docker compose exec ingestion python -m f1_ingest.cli --source jolpica --season 2024`, expected `24 rounds loaded` and, in `raw.jolpica_results`, 479 rows. Details and queries are in [Load Jolpica race results](#load-jolpica-race-results).
+
+To stop the services, run `docker compose down`. To also delete the data (fresh start), run `docker compose down -v`.
+
+The next sections are the reference for every option and the checks behind the numbers above. The Kestra path (UI, manual run, rerun, backfill) is in [Orchestration](#orchestration).
 
 ### Load data with the ingestion CLI
 
@@ -348,9 +422,9 @@ ruff format --check ingestion
 pytest ingestion
 ```
 
-Expected: `All checks passed!`, `18 files already formatted` and `91 passed, 21 deselected`.
+Expected: `All checks passed!`, `28 files already formatted` and `137 passed, 71 deselected`.
 
-The 21 deselected tests are the `integration` tests. They need the compose database and run in a throwaway database (`f1_test_<random>`, created and dropped by the tests, with the unchanged scripts from `db/init/`), so the data in `f1_db` is never touched. Start the database, load the settings from `.env` (its `POSTGRES_HOST=db` only resolves inside the compose network, so override it) and select them with the marker:
+The 71 deselected tests are the `integration` tests. They need the compose database and run in a throwaway database (`f1_test_<random>`, created and dropped by the tests, with the unchanged scripts from `db/init/`), so the data in `f1_db` is never touched. Start the database, load the settings from `.env` (its `POSTGRES_HOST=db` only resolves inside the compose network, so override it) and select them with the marker:
 
 ```bash
 docker compose up -d db
@@ -358,7 +432,7 @@ set -a; source .env; set +a
 POSTGRES_HOST=localhost pytest ingestion -m integration
 ```
 
-Expected: `21 passed, 91 deselected`. If the database is not reachable the tests are skipped with the reason, never failed.
+Expected: `71 passed, 137 deselected`. If the database is not reachable the tests are skipped with the reason, never failed. CI runs the same commands against a PostgreSQL service and fails if any of them is skipped.
 
 Smoke run against the live OpenF1 API (**needs network**). It fetches all five endpoints for one finished race (2024 Bahrain Grand Prix, `session_key` 9472) with five requests and takes about 10 seconds because of the rate limiter. Settings come from environment variables; if none are set, the defaults from `.env.example` apply.
 
@@ -377,11 +451,11 @@ EOF
 
 Expected last line: `{'sessions': 1, 'drivers': 20, 'laps': 1129, 'stints': 63, 'pit': 43}` (counts can change if OpenF1 corrects its data).
 
-The ingestion image contains the package (installed with its pinned direct dependencies), so the CLI runs with `docker compose exec`. After changing the code, rebuild with `docker compose up -d --build`. The image never contains the tests (`ingestion/.dockerignore`); they run on the host and later in CI.
+The ingestion image contains the package (installed with its pinned direct dependencies), so the CLI runs with `docker compose exec`. After changing the code, rebuild with `docker compose up -d --build`. The image never contains the tests (`ingestion/.dockerignore`); they run on the host and in CI (`.github/workflows/ci.yml`).
 
-### Cloud pipeline (Final milestone)
+### Cloud pipeline (Final milestone, not part of the midterm)
 
-> Planned — the Terraform code and the cloud sink are not yet in the repository.
+> Planned only. There is no `terraform/` directory and no cloud sink yet; `--target cloud` currently stops with "not implemented yet (final milestone)". The commands below show the intended use and do not work today.
 
 ```bash
 # Provision GCS bucket and BigQuery dataset
@@ -417,7 +491,7 @@ Every run starts three one-shot containers from the ingestion image (`f1-ingesti
 
 **Schedule:** every Monday 06:00 UTC with the season of that day and `mode=incremental`, so it loads what finished since the last run. **Concurrency:** one run at a time, a second one waits in the queue. **Retries:** each load task is tried up to 3 times with exponential backoff (30 s, then 60 s). If a task still fails, the flow ends `FAILED` and `transform` does not run.
 
-### Start Kestra and run the flow
+### Kestra path: start, run, rerun, backfill
 
 ```bash
 cp .env.example .env
@@ -425,7 +499,7 @@ docker compose up -d --build
 docker compose ps
 ```
 
-Open http://localhost:8080 and log in with the local-development values from `.env` (`KESTRA_USER` / `KESTRA_PASSWORD`, default `admin@kestra.local` / `Kestra_local_dev1`). Under **Flows** the namespace `f1rsa` holds `f1_weekly_ingestion`; Kestra also lists its own `tutorial` example flows, ignore them.
+The first start needs 30 to 60 seconds before the UI answers. Open http://localhost:8080 and log in with the local-development values from `.env` (`KESTRA_USER` / `KESTRA_PASSWORD`, default `admin@kestra.local` / `Kestra_local_dev1`). Under **Flows** the namespace `f1rsa` holds `f1_weekly_ingestion`; Kestra also lists its own `tutorial` example flows, ignore them.
 
 **Manual run:** open the flow, click **Execute**, enter `season` = 2024 and `meeting_limit` = 1, click **Execute**. Expected: the three tasks turn green (first run: OpenF1 about 10 s for one weekend, Jolpica between 40 seconds and 3.5 minutes because of its rate limit). The same run from the command line:
 
@@ -460,6 +534,78 @@ Expected on a fresh database after `season` = 2024 with `meeting_limit` = 1 (and
 
 ---
 
+## Troubleshooting
+
+Each entry has the symptom as Docker or the CLI prints it, the cause and the fix. Entries marked *reproduced* were provoked and fixed on macOS while writing this guide.
+
+### Ports in use (PostgreSQL 5432, Kestra 8080) — *reproduced*
+
+Symptom: `docker compose up` stops with `ports are not available: exposing port TCP 127.0.0.1:5433 -> 127.0.0.1:0: listen tcp4 127.0.0.1:5433: bind: address already in use` (on some systems `Bind for 127.0.0.1:5432 failed: port is already allocated`).
+
+Fix: change the published port in `.env` and start again. `POSTGRES_PORT=5433` moves PostgreSQL on the host (the containers keep using 5432 inside the network), `KESTRA_PORT=8081` moves the Kestra UI to http://localhost:8081.
+
+```bash
+docker compose up -d
+```
+
+For the host tests use the new port: `POSTGRES_PORT=5433 POSTGRES_HOST=localhost pytest ingestion -m integration` (after `set -a; source .env; set +a` it is already set). Free the old port instead if you can (`lsof -i :5432` on macOS and Linux).
+
+### The container name is already in use — *reproduced*
+
+Symptom: `Conflict. The container name "/f1_postgres" is already in use by container ...`. The containers have fixed names (`f1_postgres`, `f1_kestra`, ...), so only one copy of the stack can run on a host, for example not a second clone next to the first. Run `docker compose down` in the other copy, or `docker rm -f f1_postgres f1_kestra_postgres f1_kestra f1_ingestion`.
+
+### Docker is not running, the disk is full, or the Docker socket is not reachable
+
+- `Cannot connect to the Docker daemon` or `failed to connect to the docker API`: start Docker Desktop (macOS, Windows) or `sudo systemctl start docker` (Linux) and wait until `docker info` answers.
+- **Disk full** — *reproduced*: while pulling the 4 GB Kestra image Docker Desktop stopped with `failed to register layer: ... read-only file system` and then `Docker Desktop is unable to start`, because the Mac had less than 1 GB free. Free several GB, quit Docker Desktop completely (kill leftover `com.docker.backend` processes if it does not start) and open it again; `docker compose up -d --build` continues with the layers already pulled.
+- **Kestra needs the Docker socket** (`/var/run/docker.sock`, see `docker-compose.yml`) to start the ingestion containers. A flow task that fails with `Cannot connect to the Docker daemon` or `permission denied` means the socket is missing or not usable by the Kestra container (it runs as root).
+  - *macOS:* in Docker Desktop, Settings > Advanced, enable "Allow the default Docker socket to be used" (the path `/var/run/docker.sock` must exist).
+  - *Linux:* the socket is usually `root:docker`; running `docker` on the host as a normal user needs `sudo usermod -aG docker $USER` and a new login. With rootless Docker or Podman the socket is elsewhere (for example `$XDG_RUNTIME_DIR/docker.sock`): change the left side of the socket volume of the `kestra` service accordingly.
+  - *Windows:* use Docker Desktop with the WSL 2 backend and run the commands in a WSL shell (or Git Bash). The `/var/run/docker.sock` volume is provided by Docker Desktop. Untested by us.
+  - Without the socket the quick path above (CLI through `docker compose exec`) still works; only the Kestra flow does not.
+- The socket gives Kestra control of the host's Docker; see the limitations below and `docs/decisions.md` (M7).
+
+### An API is not reachable, or answers 429 — *reproduced for the unreachable case*
+
+OpenF1 and Jolpica are public community APIs. The client waits for `Retry-After` on a 429 (otherwise an exponential backoff with jitter), retries 5 times and then gives up. Symptom after the last retry:
+
+```
+WARNING f1_ingest.http: GET sessions {'year': 2024}: ConnectError: [Errno 111] Connection refused, retry 1/1 in 0.1s
+ERROR f1_ingest: could not list sessions: GET sessions {'year': 2024} failed after 2 attempts: ConnectError: [Errno 111] Connection refused
+```
+
+The exit code is `1`. Nothing is half-loaded; run the same command again later (a session that failed is the only one repeated). If it happens repeatedly, check your network and proxy, and lower `OPENF1_REQUESTS_PER_MINUTE` or `JOLPICA_REQUESTS_PER_MINUTE` in `.env` (after changing `.env`, run `docker compose up -d` so the ingestion container is recreated). In Kestra the task is retried automatically (3 attempts, 30 s then 60 s) before the flow fails.
+
+### The database was created before the init scripts changed
+
+Symptom: `relation "raw.jolpica_results" does not exist` or a missing table in the check of step 5. PostgreSQL runs `db/init/*.sql` only when the data volume is empty, so a database created before a script was added keeps the old schema. Recreate it (**this deletes all loaded data**, a new load restores it): `docker compose down -v && docker compose up -d --build`.
+
+### The flow is not in Kestra, or an edit does not show up
+
+Flows are read from `flows/` at startup only. After editing `flows/f1_weekly_ingestion.yml` run `docker compose restart kestra`. If the flow still does not show up (or keeps its old revision), the YAML was rejected: `docker compose logs kestra | grep -A3 "Unable to create flow"` prints the reason (Kestra 2.x spells for example `maxAttempts` and the input type `BOOL`).
+
+### Start from scratch
+
+```bash
+docker compose down -v          # containers, network and all volumes (F1 data and Kestra history)
+docker image rm f1-ingestion:local   # optional: also the locally built image
+docker compose up -d --build
+```
+
+`docker compose down` without `-v` keeps the data.
+
+### Where to find logs
+
+| What | Where |
+|------|-------|
+| A CLI run | its own output (`docker compose exec ingestion python -m f1_ingest.cli ...`) |
+| A Kestra run | the UI: Executions, the run, tab Logs (the CLI's INFO lines appear with level ERROR because Python logs to stderr; the task state is what counts); or `docker compose logs kestra` |
+| PostgreSQL | `docker compose logs db` |
+| Which sessions were attempted, when, and whether they succeeded | the table `meta.load_log` (queries above) |
+| Container state | `docker compose ps -a` |
+
+---
+
 ## Team responsibilities
 
 | Area | Primary | Secondary |
@@ -475,27 +621,59 @@ Expected on a fresh database after `season` = 2024 with `meeting_limit` = 1 (and
 
 ## Project backlog (high-level)
 
-| Week | Milestone | Key tasks |
-|------|-----------|-----------|
-| 3 | Pitch | Repository setup · API exploration · Architecture v0.1 |
-| 4–5 | Midterm prep | Ingestion scripts · PostgreSQL schema · Docker Compose · Kestra flow |
-| 6 | Midterm submission | Code freeze · Architecture v0.2 · README verification |
-| 7 | Midterm defence | Q&A |
-| 8–10 | Cloud build | Terraform · GCS upload · BigQuery schema |
-| 11–12 | Transformation | dbt models · DQ checks · partitioning decisions |
-| 13 | Final submission | Full pipeline test · documentation · known limitations |
-| 14 | Final defence | Q&A |
+| Week | Milestone | Key tasks | Status |
+|------|-----------|-----------|--------|
+| 3 | Pitch | Repository setup · API exploration · Architecture v0.1 | done |
+| 4–5 | Midterm prep | Ingestion scripts · PostgreSQL schema · Docker Compose · Kestra flow | done (M1 to M7) |
+| 6 | Midterm submission | Code freeze · Architecture v0.2 · README verification | done (M8), submission 22.10. |
+| 7 | Midterm defence | Q&A | 29.10. |
+| 8–10 | Cloud build | Terraform · GCS upload · BigQuery schema | planned |
+| 11–12 | Transformation | dbt models · DQ checks · partitioning decisions | planned |
+| 13 | Final submission | Full pipeline test · documentation · known limitations | planned |
+| 14 | Final defence | Q&A | planned |
 
 ---
 
 ## Known limitations and risks
 
-- OpenF1 and Jolpica are unofficial APIs; downtime or schema changes are outside our control.
-- Telemetry data (car_data at 3.7 Hz) is excluded from the main pipeline due to volume; may be loaded selectively for specific sessions.
-- Jolpica rate limits require deliberate throttling; initial backfill may take several hours.
-- Pre-2023 data (Jolpica results) has lower detail granularity than 2023+ OpenF1 sessions.
-- Jolpica returns pit stop `duration` as a string (e.g. `"24.418"`), not a numeric type — explicit casting is required during ingestion.
+The details and the reasons are in the "Known limits" of each entry in [docs/decisions.md](docs/decisions.md).
+
+**Data sources**
+- OpenF1 and Jolpica are unofficial, community-run APIs; downtime or schema changes are outside our control. Lap time data may be missing for DNFs, Safety Car periods or red-flagged sessions.
+- OpenF1 documents no rate limit and sends no rate-limit headers. 24 requests per minute is our conservative assumption (the plan says 30). Jolpica documents 4 per second and 500 per hour and has announced lower limits; we use 6 per minute. A real 429 was not provoked, so its body and header are not verified.
+- The rate limits are per process. Two clients at the same time (for example a manual CLI run next to a Kestra run) each get their own budget.
+- Only Race and Sprint sessions are loaded by default (other types with `--session-type`). There is no load of `raw.meetings`, `weather` or `race_control` yet, and telemetry (car data at 3.7 Hz) is excluded for volume.
+- Jolpica: only races and race results. Sprint results, qualifying, pit stops and standings are separate endpoints that are not loaded, so the points sum is lower than the championship (Verstappen 399 against 437 for 2024). All values stay strings in `raw` and are typed later.
+- There is no mapping between OpenF1 and Jolpica identifiers yet (`driverId` against `driver_number`, `round` against `meeting_key`), so the two sources are not joined.
+- Loading a season takes a few minutes (about 30 sessions at 8 seconds each) and a full backfill from 2023 is one run per season.
+
+**Loading and reruns**
+- One run at a time is assumed. At its start a run sets the `running` rows of other runs to `failed`, which would also close the rows of a run that is still working. Kestra enforces one run at a time (concurrency limit 1); two manual CLI runs in parallel are not prevented.
+- Upserts only add and overwrite: records that an API deletes are not deleted here. A correction of already loaded data is picked up only by `--mode full`, because incremental runs skip loaded sessions and rounds.
+- `date_end` (or the race start for Jolpica) in the past is our definition of "finished"; whether the API has finalised the data by then is not verified. `--mode full` repairs a session loaded too early.
+- A session whose latest full reload failed still counts as loaded because of its earlier `success` rows; each endpoint is atomic, but the session may mix old and new data.
+- `raw.pit` uses the entry timestamp as key: a timestamp that OpenF1 corrects later arrives as a second row and the old one stays (visible by a query).
+- Transitive Python dependencies (httpcore, h11, certifi, ...) are not pinned; the direct dependencies, the base images and Kestra are.
+
+**Transformation**
+- `core.laps_enriched` is a view, computed on every query; that is fast at this size and would need a table or dbt model for much more data.
+- Laps without a stint have no compound or tyre age (0.21 % of the laps of 2024, reported per session); nothing is guessed. Only 2024 was checked for the data patterns.
+- `tyre_age_laps` is not on the same scale in all sessions: with a shared boundary lap the out lap has age 1, otherwise 0 (one lap, only for the first lap of each stint after the first). The "earliest stint" rule was verified against `/pit` for one session only.
+- Lap times are not corrected for fuel load or traffic, so averages by tyre age mix these effects and degradation slopes are understated.
+
+**Orchestration and security**
+- Kestra starts the ingestion containers through `/var/run/docker.sock`. A root process with that socket controls the host's Docker, which is in effect root on the host. Mitigations: the UI and the database ports are bound to `127.0.0.1`, the UI needs a login, and only `flows/` is mounted (read-only). Not done: a socket proxy, rootless Docker.
+- The passwords in `.env.example` (database and Kestra login) are known local-development values and must not be used anywhere else.
+- The schedule starts every Monday 06:00 UTC with the year of that day as season, so a race weekend of the old season that finishes after the last Monday of December is picked up only by a manual run with that season. There is no alerting on failure; the failed run is visible in the Kestra UI.
+- Flows are read at startup, so an edit needs `docker compose restart kestra`. The Kestra 2.x syntax differs from many online examples (see Troubleshooting). At startup Kestra logs that it "auto-installed" the `plugin-docker` artifact; the image already contains the plugin and the flow ran with that one, but we did not explain the message. Python logs go to stderr, so Kestra shows the CLI's INFO lines with level ERROR. Kestra also lists its own `tutorial` example flows.
+
+**Environment and scope**
+- Not part of the midterm: the cloud target (`--target cloud` stops with "not implemented yet"), Terraform, the Cloud Storage and BigQuery layers, dbt and the marts `fct_*` and `dim_*` of the target data model.
+- `db/init/` runs only on an empty volume and there is no migration tool: a schema change needs `docker compose down -v` (which deletes the data).
+- The containers have fixed names, so only one copy of the stack runs per host.
+- The integration tests need a PostgreSQL server (the compose database locally, a service in CI).
+- Tested on macOS with Docker Desktop only. Linux and Windows are documented but untested by us; the first start pulls about 4 GB.
 
 ---
 
-*Architecture v0.1 – 01.10.2026 | Subject to revision after implementation experience*
+*Architecture v0.2 – 22.10.2026 (midterm) | Subject to revision for the final milestone*
