@@ -97,6 +97,11 @@ services:
     container_name: f1_ingestion
     restart: unless-stopped
     env_file: .env
+    environment:
+      # POSTGRES_PORT in .env is the port published on the host (it may be changed when 5432 is
+      # taken); inside the network Postgres always listens on 5432.
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
     depends_on:
       db:
         condition: service_healthy
