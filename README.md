@@ -636,11 +636,43 @@ docker compose up -d --build
 
 ## Known limitations and risks
 
-- OpenF1 and Jolpica are unofficial APIs; downtime or schema changes are outside our control.
-- Telemetry data (car_data at 3.7 Hz) is excluded from the main pipeline due to volume; may be loaded selectively for specific sessions.
-- Jolpica rate limits require deliberate throttling; initial backfill may take several hours.
-- Pre-2023 data (Jolpica results) has lower detail granularity than 2023+ OpenF1 sessions.
-- Jolpica returns pit stop `duration` as a string (e.g. `"24.418"`), not a numeric type — explicit casting is required during ingestion.
+The details and the reasons are in the "Known limits" of each entry in [docs/decisions.md](docs/decisions.md).
+
+**Data sources**
+- OpenF1 and Jolpica are unofficial, community-run APIs; downtime or schema changes are outside our control. Lap time data may be missing for DNFs, Safety Car periods or red-flagged sessions.
+- OpenF1 documents no rate limit and sends no rate-limit headers. 24 requests per minute is our conservative assumption (the plan says 30). Jolpica documents 4 per second and 500 per hour and has announced lower limits; we use 6 per minute. A real 429 was not provoked, so its body and header are not verified.
+- The rate limits are per process. Two clients at the same time (for example a manual CLI run next to a Kestra run) each get their own budget.
+- Only Race and Sprint sessions are loaded by default (other types with `--session-type`). There is no load of `raw.meetings`, `weather` or `race_control` yet, and telemetry (car data at 3.7 Hz) is excluded for volume.
+- Jolpica: only races and race results. Sprint results, qualifying, pit stops and standings are separate endpoints that are not loaded, so the points sum is lower than the championship (Verstappen 399 against 437 for 2024). All values stay strings in `raw` and are typed later.
+- There is no mapping between OpenF1 and Jolpica identifiers yet (`driverId` against `driver_number`, `round` against `meeting_key`), so the two sources are not joined.
+- Loading a season takes a few minutes (about 30 sessions at 8 seconds each) and a full backfill from 2023 is one run per season.
+
+**Loading and reruns**
+- One run at a time is assumed. At its start a run sets the `running` rows of other runs to `failed`, which would also close the rows of a run that is still working. Kestra enforces one run at a time (concurrency limit 1); two manual CLI runs in parallel are not prevented.
+- Upserts only add and overwrite: records that an API deletes are not deleted here. A correction of already loaded data is picked up only by `--mode full`, because incremental runs skip loaded sessions and rounds.
+- `date_end` (or the race start for Jolpica) in the past is our definition of "finished"; whether the API has finalised the data by then is not verified. `--mode full` repairs a session loaded too early.
+- A session whose latest full reload failed still counts as loaded because of its earlier `success` rows; each endpoint is atomic, but the session may mix old and new data.
+- `raw.pit` uses the entry timestamp as key: a timestamp that OpenF1 corrects later arrives as a second row and the old one stays (visible by a query).
+- Transitive Python dependencies (httpcore, h11, certifi, ...) are not pinned; the direct dependencies, the base images and Kestra are.
+
+**Transformation**
+- `core.laps_enriched` is a view, computed on every query; that is fast at this size and would need a table or dbt model for much more data.
+- Laps without a stint have no compound or tyre age (0.21 % of the laps of 2024, reported per session); nothing is guessed. Only 2024 was checked for the data patterns.
+- `tyre_age_laps` is not on the same scale in all sessions: with a shared boundary lap the out lap has age 1, otherwise 0 (one lap, only for the first lap of each stint after the first). The "earliest stint" rule was verified against `/pit` for one session only.
+- Lap times are not corrected for fuel load or traffic, so averages by tyre age mix these effects and degradation slopes are understated.
+
+**Orchestration and security**
+- Kestra starts the ingestion containers through `/var/run/docker.sock`. A root process with that socket controls the host's Docker, which is in effect root on the host. Mitigations: the UI and the database ports are bound to `127.0.0.1`, the UI needs a login, and only `flows/` is mounted (read-only). Not done: a socket proxy, rootless Docker.
+- The passwords in `.env.example` (database and Kestra login) are known local-development values and must not be used anywhere else.
+- The schedule starts every Monday 06:00 UTC with the year of that day as season, so a race weekend of the old season that finishes after the last Monday of December is picked up only by a manual run with that season. There is no alerting on failure; the failed run is visible in the Kestra UI.
+- Flows are read at startup, so an edit needs `docker compose restart kestra`. The Kestra 2.x syntax differs from many online examples (see Troubleshooting). At startup Kestra logs that it "auto-installed" the `plugin-docker` artifact; the image already contains the plugin and the flow ran with that one, but we did not explain the message. Python logs go to stderr, so Kestra shows the CLI's INFO lines with level ERROR. Kestra also lists its own `tutorial` example flows.
+
+**Environment and scope**
+- Not part of the midterm: the cloud target (`--target cloud` stops with "not implemented yet"), Terraform, the Cloud Storage and BigQuery layers, dbt and the marts `fct_*` and `dim_*` of the target data model.
+- `db/init/` runs only on an empty volume and there is no migration tool: a schema change needs `docker compose down -v` (which deletes the data).
+- The containers have fixed names, so only one copy of the stack runs per host.
+- The integration tests need a PostgreSQL server (the compose database locally, a service in CI).
+- Tested on macOS with Docker Desktop only. Linux and Windows are documented but untested by us; the first start pulls about 4 GB.
 
 ---
 
