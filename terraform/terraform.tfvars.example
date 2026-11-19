@@ -1,0 +1,6 @@
+# Copy to terraform.tfvars (ignored by git) and set your own project ID.
+project_id = "your-gcp-project-id"
+
+# Optional, the defaults are shown.
+# region        = "europe-west6"
+# force_destroy = true
