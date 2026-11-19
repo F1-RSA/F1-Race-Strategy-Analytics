@@ -126,11 +126,13 @@ F1-Race-Strategy-Analytics/
 │   └── sample_data/                  # Raw API sample responses (CSV)
 ├── flows/
 │   └── f1_weekly_ingestion.yml       # Kestra flow, loaded automatically at startup
+├── terraform/                  # GCS bucket, BigQuery datasets, service account and its roles
+│   └── terraform.tfvars.example      # Copy to terraform.tfvars and set project_id
 ├── sql/                        # Empty placeholder (the transformation SQL lives in ingestion/f1_ingest/sql/)
 └── img/                        # Logo and banner used in the README
 ```
 
-`terraform/`, `transformation/dbt/` and the cloud sink do not exist yet; they belong to the final milestone (see backlog).
+`transformation/dbt/` and the cloud sink do not exist yet; they belong to the final milestone (see backlog).
 
 ---
 
@@ -143,7 +145,7 @@ F1-Race-Strategy-Analytics/
 - Internet access: Docker Hub and the two public APIs (OpenF1, Jolpica).
 - Free ports `5432` (PostgreSQL) and `8080` (Kestra UI) on `127.0.0.1`; both can be changed in `.env`.
 - Python 3.11+ only to run the lint and tests on the host (if `python3 --version` is older, use `python3.11`).
-- Terraform and a Google Cloud project are needed only for the final milestone, not for anything in this guide.
+- Terraform and a Google Cloud project are needed only for the cloud part ([Cloud infrastructure](#cloud-infrastructure-terraform)), not for the local path.
 
 The commands were run on macOS with Docker Desktop. Linux and Windows are described in [Troubleshooting](#troubleshooting) but not tested by us.
 
@@ -453,18 +455,91 @@ Expected last line: `{'sessions': 1, 'drivers': 20, 'laps': 1129, 'stints': 63, 
 
 The ingestion image contains the package (installed with its pinned direct dependencies), so the CLI runs with `docker compose exec`. After changing the code, rebuild with `docker compose up -d --build`. The image never contains the tests (`ingestion/.dockerignore`); they run on the host and in CI (`.github/workflows/ci.yml`).
 
-### Cloud pipeline (Final milestone, not part of the midterm)
+### Cloud infrastructure (Terraform)
 
-> Planned only. There is no `terraform/` directory and no cloud sink yet; `--target cloud` currently stops with "not implemented yet (final milestone)". The commands below show the intended use and do not work today.
+`terraform/` creates everything the cloud pipeline needs in an existing Google Cloud project. The only required variable is `project_id`; `region` defaults to `europe-west6` (Zurich).
+
+| Resource | Name | Purpose |
+|----------|------|---------|
+| APIs | BigQuery, Cloud Storage, IAM, Cloud Resource Manager | Enabled if the project does not have them yet; they stay enabled after `destroy` |
+| Cloud Storage bucket | `<project_id>-f1-raw` | Raw zone of the data lake (NDJSON per session and endpoint, F2). Uniform access, public access prevented, no versioning, no soft delete |
+| BigQuery datasets | `f1_raw`, `f1_staging`, `f1_marts` | External tables over the bucket (F3), dbt staging and marts (F4); same location as the bucket |
+| Service account | `f1-pipeline@<project_id>.iam.gserviceaccount.com` | Identity of the pipeline; Terraform creates no key |
+
+**Roles of the service account** (and why not more):
+
+| Role | Scope | Why |
+|------|-------|-----|
+| `roles/storage.objectAdmin` | the raw bucket only | Write, list, read and overwrite objects (a rerun replaces the same object, which needs delete). No bucket settings, no other buckets |
+| `roles/bigquery.dataEditor` | the three datasets only | Create and replace external tables, views and tables. No access to other datasets, cannot create datasets |
+| `roles/bigquery.jobUser` | project | Every query is a job, and jobs can only be granted at project level. Gives no access to data by itself |
+
+#### Prerequisites
+
+- A Google Cloud project with a **billing account linked** (Cloud Storage needs billing; the free tier covers the volumes of this project).
+- [Terraform](https://developer.hashicorp.com/terraform/install) 1.5 or newer (`terraform version`).
+- [Google Cloud CLI](https://cloud.google.com/sdk/docs/install) (`gcloud version`), used only to log in.
+- The person running `terraform apply` needs `roles/owner` on the project, or these roles: `roles/serviceusage.serviceUsageAdmin`, `roles/storage.admin`, `roles/bigquery.admin`, `roles/iam.serviceAccountAdmin`, `roles/resourcemanager.projectIamAdmin`.
+
+#### Apply
 
 ```bash
-# Provision GCS bucket and BigQuery dataset
+# 1. Log in; Terraform uses these application default credentials
+gcloud auth application-default login
+
+# 2. Set your project ID (terraform.tfvars is ignored by git)
 cd terraform
+cp terraform.tfvars.example terraform.tfvars
+# edit terraform.tfvars: project_id = "<your-project-id>"
+
+# 3. Create the resources (about 1-2 minutes, 14 resources on an empty project)
 terraform init
 terraform plan
 terraform apply
 
-# Run full ingestion to cloud
+# 4. Names for the next steps
+terraform output
+```
+
+Instead of the file, the project ID can be passed directly: `terraform apply -var="project_id=<your-project-id>"`.
+
+#### Verify
+
+```bash
+PROJECT_ID=$(terraform output -raw project_id)
+
+# Bucket exists in the region and is not public
+gcloud storage buckets describe gs://$(terraform output -raw bucket_name) \
+  --format="value(location,iamConfiguration.publicAccessPrevention)"
+
+# The three datasets
+bq ls --project_id=$PROJECT_ID
+
+# Roles of the service account at project level (only roles/bigquery.jobUser)
+gcloud projects get-iam-policy $PROJECT_ID \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:$(terraform output -raw service_account_email)" \
+  --format="value(bindings.role)"
+```
+
+#### Destroy
+
+```bash
+cd terraform
+terraform destroy
+```
+
+`destroy` also deletes the data in the bucket and the datasets (`force_destroy = true`), because the raw zone can be reloaded from the APIs. Set `force_destroy = false` in `terraform.tfvars` to make `destroy` fail while data exists. The enabled APIs stay enabled. The service account ID `f1-pipeline` cannot be reused for a few minutes after it was deleted, so an `apply` right after a `destroy` can fail with "already exists"; waiting and running `apply` again solves it.
+
+#### Credentials for the pipeline
+
+Terraform creates no service account key, because a key in the state file would be stored in plain text. How the ingestion and dbt get credentials for this service account is part of the cloud ingestion (F2). Whatever the method, a key file never goes into the repository; `.gitignore` excludes `*-key.json`, `*credentials*.json` and `service-account*.json`, and the state files.
+
+### Cloud ingestion (Final milestone, not implemented yet)
+
+> `--target cloud` currently stops with "not implemented yet (final milestone)". The command below shows the intended use and does not work today.
+
+```bash
 docker compose run ingestion python -m f1_ingest.cli --season 2024 --target cloud
 ```
 
