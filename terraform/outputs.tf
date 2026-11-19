@@ -8,6 +8,11 @@ output "bucket_name" {
   value       = google_storage_bucket.raw.name
 }
 
+output "datasets" {
+  description = "BigQuery dataset IDs per layer."
+  value       = { for k, d in google_bigquery_dataset.this : k => d.dataset_id }
+}
+
 output "region" {
   description = "Location of the bucket and the datasets."
   value       = var.region
